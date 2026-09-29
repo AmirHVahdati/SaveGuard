@@ -472,9 +472,24 @@ class MainWindow(QMainWindow):
         running = list(self.workers.values())
         if self.scan_worker is not None:
             running.append(self.scan_worker)
-        for worker in running:
-            if worker.isRunning():
-                worker.wait(3000)
+
+        in_flight = [w for w in running if w.isRunning()]
+        if in_flight:
+            reply = QMessageBox.question(
+                self,
+                "Backups in progress",
+                "SaveGuard is currently backing up game(s). "
+                "Quitting now may leave those backups incomplete.\n\n"
+                "Do you want to quit anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                # Don't quit - let the backups finish. The window stays open
+                # and the user can continue using the app while backups run.
+                event.ignore()
+                return
+
         event.accept()
 
     # ---------------- search ----------------
