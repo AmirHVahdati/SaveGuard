@@ -537,7 +537,7 @@ class MainWindow(QMainWindow):
             card.set_progress(current, total)
 
     def _on_backup_finished(self, game_id: str, new_snapshot: dict, timestamp: str,
-                             dest_dir: str, backups_remaining: int):
+                             zip_path: str, backups_remaining: int):
         game = self.games.get(game_id)
         card = self.cards.get(game_id)
         if not game:
@@ -560,7 +560,7 @@ class MainWindow(QMainWindow):
             card.set_status("synced")
             card.refresh_meta()
 
-        self.status_bar.showMessage(f"Backed up “{game.name}” to {dest_dir}", 6000)
+        self.status_bar.showMessage(f"Backed up “{game.name}” to {zip_path}", 6000)
         self._update_banner_from_cache()
         self._refresh_status_bar()
         self._update_backup_all_button()
