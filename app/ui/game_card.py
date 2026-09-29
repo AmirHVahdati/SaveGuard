@@ -1,6 +1,7 @@
 """A single 'card' widget representing one tracked game inside the main list."""
 
 import os
+import re
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal, QUrl
@@ -11,6 +12,9 @@ from PySide6.QtWidgets import (
 )
 
 from app.ui.color_picker_popup import ColorPickerPopup
+
+# Matches a valid hex color like "#7c5cff" (6 hex digits after #)
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 STATUS_TEXT = {
     "synced": "Up to date",
@@ -185,6 +189,11 @@ class GameCard(QFrame):
 
     def _apply_avatar_color(self):
         color = self.game.color or _default_color_for(self.game.name)
+        # Validate color format — malformed strings (e.g. from hand-edited
+        # settings.json) would produce invalid CSS. Fall back to the default
+        # color if the stored value doesn't match the hex pattern.
+        if color and not _HEX_COLOR_RE.match(color):
+            color = _default_color_for(self.game.name)
         self.icon_label.setProperty("current_color", color)
         self.icon_label.setStyleSheet(
             f"background-color: #22{color[1:]}; color: {color}; "
