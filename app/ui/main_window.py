@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self.status_cache: dict[str, str] = {}  # game_id -> status, refreshed on demand
         self.scan_worker: GameScanWorker = None
         self.settings: dict = load_settings()
+        self._status_update_pending: bool = False  # for batching UI updates during backup completions
 
         self._load_games()
         self._build_ui()             # builds cards, banner, status bar with cached (or default) statuses
@@ -274,9 +275,7 @@ class MainWindow(QMainWindow):
         self._recompute_statuses()
         for game_id, card in self.cards.items():
             card.set_status(self.status_cache.get(game_id, "invalid"))
-        self._update_banner_from_cache()
-        self._refresh_status_bar()
-        self._update_backup_all_button()
+        self._flush_status_update()
 
     def _on_startup_status_ready(self):
         """Called via QTimer after the window is first shown. Computes save
@@ -291,9 +290,7 @@ class MainWindow(QMainWindow):
         self._recompute_statuses()
         for game_id, card in self.cards.items():
             card.set_status(self.status_cache.get(game_id, "invalid"))
-        self._update_banner_from_cache()
-        self._refresh_status_bar()
-        self._update_backup_all_button()
+        self._flush_status_update()
 
     def _show_startup_summary(self):
         changed = [g.name for g in self.games.values() if self.status_cache.get(g.id) == "changed"]
@@ -613,12 +610,32 @@ class MainWindow(QMainWindow):
             card.refresh_meta()
 
         self.status_bar.showMessage(f"Backed up “{game.name}” to {zip_path}", 6000)
-        self._update_banner_from_cache()
-        self._refresh_status_bar()
-        self._update_backup_all_button()
+        # Batch UI updates during rapid backup completions to avoid redundant
+        # refreshes when multiple backups finish close together
+        self._schedule_status_update()
 
     def _on_backup_error(self, game_id: str, message: str):
         card = self.cards.get(game_id)
         if card:
             card.set_backing_up(False)
         QMessageBox.critical(self, "Backup failed", message)
+        # Also update UI in case other backups were waiting to refresh
+        self._schedule_status_update()
+
+    def _schedule_status_update(self):
+        """Debounce status UI updates (.update_banner_from_cache, refresh
+        status bar, update backup button). When multiple backups complete in
+        quick succession (Backup All with several games), refreshing the UI
+        each time is redundant — this batches them into a single refresh by
+        coalescing multiple calls within the same event loop iteration."""
+        if not self._status_update_pending:
+            self._status_update_pending = True
+            QTimer.singleShot(0, self._flush_status_update)
+
+    def _flush_status_update(self):
+        """Perform the actual batched UI refresh. Called once via QTimer after
+        all pending backup completions have been processed."""
+        self._status_update_pending = False
+        self._update_banner_from_cache()
+        self._refresh_status_bar()
+        self._update_backup_all_button()
