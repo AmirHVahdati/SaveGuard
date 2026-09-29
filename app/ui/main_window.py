@@ -50,10 +50,13 @@ class MainWindow(QMainWindow):
         self.settings: dict = load_settings()
 
         self._load_games()
-        self._recompute_statuses()   # one disk walk per game, populates the cache
-        self._build_ui()             # cards, banner, status bar all read from the cache
-        self._show_startup_summary()
+        self._build_ui()             # builds cards, banner, status bar with cached (or default) statuses
         self._maybe_run_first_scan()
+        
+        # Compute statuses on next event loop iteration, after the window
+        # is visible — avoids freezing the startup UI when there are many
+        # games with large save folders to scan.
+        QTimer.singleShot(0, self._on_startup_status_ready)
 
     # ---------------- data ----------------
 
@@ -264,6 +267,23 @@ class MainWindow(QMainWindow):
         )
         for game in targets:
             self.status_cache[game.id] = self._compute_status(game)
+
+    def _recompute_and_refresh(self):
+        """Recompute statuses for all games and update the UI in one pass.
+        Used after the first scan completes or when explicitly requested."""
+        self._recompute_statuses()
+        for game_id, card in self.cards.items():
+            card.set_status(self.status_cache.get(game_id, "invalid"))
+        self._update_banner_from_cache()
+        self._refresh_status_bar()
+        self._update_backup_all_button()
+
+    def _on_startup_status_ready(self):
+        """Called via QTimer after the window is first shown. Computes save
+        folder statuses (which can take time on large folders) without
+        blocking the initial window paint."""
+        self._recompute_and_refresh()
+        self._show_startup_summary()
 
     def _rescan_all(self):
         """Full manual rescan — used by the 'Rescan' button. Walks every
