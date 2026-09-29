@@ -213,6 +213,8 @@ class MainWindow(QMainWindow):
     # ---------------- card list management ----------------
 
     def _rebuild_cards(self):
+        """Full rebuild of the entire card list. Used only during initialization
+        or when the game list is fundamentally restructured."""
         # clear existing widgets (except the trailing stretch)
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
@@ -232,14 +234,36 @@ class MainWindow(QMainWindow):
             return
 
         for game in sorted(self.games.values(), key=lambda g: g.name.lower()):
-            status = self.status_cache.get(game.id, "never")
-            card = GameCard(game, status)
-            card.backup_requested.connect(self._on_backup_requested)
-            card.edit_requested.connect(self._on_edit_game)
-            card.remove_requested.connect(self._on_remove_game)
-            card.color_changed.connect(self._on_color_changed)
-            self.cards[game.id] = card
-            self.list_layout.insertWidget(self.list_layout.count() - 1, card)
+            self._add_card_for_game(game)
+
+    def _add_card_for_game(self, game: Game):
+        """Create and insert a single GameCard for the given game at the
+        correct sorted position."""
+        status = self.status_cache.get(game.id, "never")
+        card = GameCard(game, status)
+        card.backup_requested.connect(self._on_backup_requested)
+        card.edit_requested.connect(self._on_edit_game)
+        card.remove_requested.connect(self._on_remove_game)
+        card.color_changed.connect(self._on_color_changed)
+        self.cards[game.id] = card
+
+        # Insert in sorted position to maintain ordering without full rebuild
+        insert_pos = 0
+        target_name = game.name.lower()
+        for i in range(self.list_layout.count() - 1):  # skip trailing stretch
+            widget = self.list_layout.itemAt(i).widget()
+            if isinstance(widget, GameCard) and widget.game.name.lower() < target_name:
+                insert_pos = i + 1
+            else:
+                break
+        self.list_layout.insertWidget(insert_pos, card)
+
+    def _remove_card_for_game(self, game_id: str):
+        """Remove and clean up the GameCard for the given game."""
+        card = self.cards.pop(game_id, None)
+        if card:
+            self.list_layout.removeWidget(card)
+            card.deleteLater()
 
     # ---------------- status / scanning ----------------
     #
@@ -341,10 +365,8 @@ class MainWindow(QMainWindow):
             self.games[game.id] = game
             self._persist()
             self._recompute_statuses(game_ids=[game.id])  # only walk the new game's folder
-            self._rebuild_cards()
-            self._update_banner_from_cache()
-            self._refresh_status_bar()
-            self._update_backup_all_button()
+            self._add_card_for_game(game)
+            self._flush_status_update()
 
     def _on_edit_game(self, game_id: str):
         game = self.games.get(game_id)
@@ -353,15 +375,22 @@ class MainWindow(QMainWindow):
         dialog = AddGameDialog(self, existing=game)
         if dialog.exec():
             data = dialog.result_data
+            old_name = game.name  # for detecting if card needs repositioning
             game.name = data["name"]
             game.save_path = data["save_path"]
             game.backup_root = data["backup_root"]
             self._persist()
             self._recompute_statuses(game_ids=[game.id])  # path may have changed, re-check just this one
-            self._rebuild_cards()
-            self._update_banner_from_cache()
-            self._refresh_status_bar()
-            self._update_backup_all_button()
+            # Refresh card in place (name change may affect sort order)
+            if game.name.lower() != old_name.lower():
+                self._remove_card_for_game(game_id)
+                self._add_card_for_game(game)
+            else:
+                card = self.cards.get(game_id)
+                if card:
+                    card.refresh_meta()
+                    card.set_status(self.status_cache.get(game_id, "invalid"))
+            self._flush_status_update()
 
     def _on_remove_game(self, game_id: str):
         game = self.games.get(game_id)
@@ -375,12 +404,10 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             del self.games[game_id]
+            self._remove_card_for_game(game_id)
             self.status_cache.pop(game_id, None)  # no disk access needed at all
             self._persist()
-            self._rebuild_cards()
-            self._update_banner_from_cache()
-            self._refresh_status_bar()
-            self._update_backup_all_button()
+            self._flush_status_update()
 
     def _on_color_changed(self, game_id: str, new_color):
         game = self.games.get(game_id)
@@ -473,10 +500,11 @@ class MainWindow(QMainWindow):
 
         self._persist()
         self._recompute_statuses(game_ids=new_ids)  # only walk the newly added games
-        self._rebuild_cards()
-        self._update_banner_from_cache()
-        self._refresh_status_bar()
-        self._update_backup_all_button()
+        # Add cards for the newly discovered games in sorted order
+        new_games = [self.games[gid] for gid in new_ids]
+        for game in sorted(new_games, key=lambda g: g.name.lower()):
+            self._add_card_for_game(game)
+        self._flush_status_update()
         self.status_bar.showMessage(
             f"Added {len(candidates)} game{'s' if len(candidates) != 1 else ''} from scan.", 5000
         )
