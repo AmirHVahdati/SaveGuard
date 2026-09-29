@@ -2,6 +2,8 @@
 added as new tabs (or new rows within an existing tab) without needing to
 redesign this dialog — today there's a "Backups" tab and an "About" tab."""
 
+import os
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -247,6 +249,15 @@ class SettingsDialog(QDialog):
 
         path = self.scan_backup_root_edit.text().strip()
         if path:
+            if not os.path.isdir(path):
+                QMessageBox.warning(
+                    self,
+                    "Invalid path",
+                    f"The folder you entered doesn't exist:\n{path}\n\n"
+                    "Please choose an existing folder, or clear the field to use "
+                    "the default location.",
+                )
+                return
             self.settings["default_scan_backup_root"] = path
         # if left blank, silently keep whatever was there before rather than
         # writing an empty path — MainWindow always has a sane built-in
