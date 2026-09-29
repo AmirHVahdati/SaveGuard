@@ -532,10 +532,27 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("No changed saves to back up right now.", 4000)
             return
 
-        for game_id in changed_ids:
-            self._on_backup_requested(game_id)
+        # Disable the button while starting backups to prevent re-entry
+        # (e.g., user clicking "Backup All" again while backups are starting)
+        self.backup_all_btn.setEnabled(False)
 
-        self.status_bar.showMessage(f"Backing up {len(changed_ids)} game(s)…", 4000)
+        # Queue up the backup requests so we don't have reentrancy issues
+        # if any backup finishes very quickly during the loop
+        pending = list(changed_ids)
+
+        def start_next():
+            if not pending:
+                self.backup_all_btn.setEnabled(True)
+                self._update_backup_all_button()
+                self.status_bar.showMessage(f"Backing up {len(changed_ids)} game(s)…", 4000)
+                return
+            game_id = pending.pop(0)
+            self._on_backup_requested(game_id)
+            # Schedule next iteration on next event loop tick to allow
+            # any rapid completions to settle
+            QTimer.singleShot(0, start_next)
+
+        QTimer.singleShot(0, start_next)
 
     def _on_backup_requested(self, game_id: str):
         game = self.games.get(game_id)
