@@ -242,8 +242,8 @@ class GameCard(QFrame):
         self.status = status
         self.status_badge.setText(STATUS_TEXT.get(status, status))
         self.status_badge.setProperty("status", status)
-        self.status_badge.style().unpolish(self.status_badge)
         self.status_badge.style().polish(self.status_badge)
+        self.status_badge.update()
 
     def refresh_meta(self):
         self.meta_label.setText(self._meta_text())
