@@ -1,4 +1,5 @@
 """Modal dialog used both to add a new game and to edit an existing one."""
+import os
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -116,6 +117,13 @@ class AddGameDialog(QDialog):
             return
         if not save_path:
             QMessageBox.warning(self, "Missing info", "Please choose the save folder.")
+            return
+        if not os.path.isdir(save_path):
+            QMessageBox.warning(
+                self, "Save folder not found",
+                f"The save folder doesn't exist:\n{save_path}\n\n"
+                "Please browse to select a folder that exists.",
+            )
             return
         if not backup_path:
             QMessageBox.warning(self, "Missing info", "Please choose a backup destination.")
