@@ -9,7 +9,7 @@ more than once per game per user action (see _recompute_statuses).
 
 import os
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, QEvent
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -33,6 +33,14 @@ from app.ui.settings_dialog import SettingsDialog
 # nothing else in the app depends on this being a placeholder.
 SUPPORT_URL = "https://donatr.ee/REPLACE_WITH_REAL_LINK"
 
+# Number of extra items to render above/below the visible viewport as a buffer
+# so cards don't pop in/out abruptly while scrolling.
+VIRTUAL_BUFFER = 3
+
+# Approximate height of a GameCard in pixels (including vertical margin/spacing)
+# Used to estimate which cards are visible during scroll.
+CARD_HEIGHT = 268  # card height (~240) + margin/spacing
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -51,12 +59,9 @@ class MainWindow(QMainWindow):
         self._status_update_pending: bool = False  # for batching UI updates during backup completions
 
         self._load_games()
-        self._build_ui()             # builds cards, banner, status bar with cached (or default) statuses
+        self._build_ui()
         self._maybe_run_first_scan()
         
-        # Compute statuses on next event loop iteration, after the window
-        # is visible — avoids freezing the startup UI when there are many
-        # games with large save folders to scan.
         QTimer.singleShot(0, self._on_startup_status_ready)
 
     # ---------------- data ----------------
@@ -91,16 +96,19 @@ class MainWindow(QMainWindow):
         # Scroll area with card list
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
         self.list_layout.setContentsMargins(24, 18, 24, 24)
         self.list_layout.setSpacing(14)
         self.list_layout.addStretch()
         self.scroll.setWidget(self.list_container)
+        self.scroll.installEventFilter(self)
         root.addWidget(self.scroll, 1)
 
         self.status_bar = self.statusBar()
 
+        self._all_game_ids: list = []  # sorted list of all game IDs
         self._rebuild_cards()
         self._update_banner_from_cache()
         self._refresh_status_bar()
@@ -212,20 +220,24 @@ class MainWindow(QMainWindow):
 
     # ---------------- card list management ----------------
 
+    # Threshold for virtual scrolling — above this, we lazily create cards
+    # only when they come into view rather than creating all at once.
+    _VIRTUAL_SCROLL_THRESHOLD = 50
+
     def _rebuild_cards(self):
-        """Full rebuild of the entire card list. Used only during initialization
-        or when the game list is fundamentally restructured."""
-        # clear existing widgets (except the trailing stretch)
+        """Rebuild the complete card list from the games dict. Used during
+        initialization and when the game list is fundamentally restructured."""
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
         self.cards.clear()
+        self._all_game_ids.clear()
 
         if not self.games:
             empty = QLabel(
-                "No games added yet.\nClick “+ Add Game” to start tracking a save folder."
+                "No games added yet.\nClick \u201c+ Add Game\u201d to start tracking a save folder."
             )
             empty.setObjectName("EmptyState")
             empty.setAlignment(Qt.AlignCenter)
@@ -233,8 +245,26 @@ class MainWindow(QMainWindow):
             self.list_layout.insertWidget(0, empty)
             return
 
-        for game in sorted(self.games.values(), key=lambda g: g.name.lower()):
-            self._add_card_for_game(game)
+        sorted_games = sorted(self.games.values(), key=lambda g: g.name.lower())
+        self._all_game_ids = [g.id for g in sorted_games]
+
+        if len(sorted_games) <= self._VIRTUAL_SCROLL_THRESHOLD:
+            # Small list: create all cards immediately
+            for game in sorted_games:
+                self._add_card_for_game(game)
+        else:
+            # Large list: create only initially visible cards, defer the rest
+            self._create_visible_cards()
+
+    def _create_visible_cards(self):
+        """Create GameCard widgets only for games currently visible in the
+        scroll viewport, plus a small buffer. Other games are tracked in
+        _all_game_ids and created lazily on scroll."""
+        visible_start, visible_end = self._get_visible_range()
+        for i in range(visible_start, min(visible_end, len(self._all_game_ids))):
+            game = self.games[self._all_game_ids[i]]
+            if game.id not in self.cards:
+                self._add_card_for_game(game)
 
     def _add_card_for_game(self, game: Game):
         """Create and insert a single GameCard for the given game at the
@@ -264,6 +294,65 @@ class MainWindow(QMainWindow):
         if card:
             self.list_layout.removeWidget(card)
             card.deleteLater()
+        if game_id in self._all_game_ids:
+            self._all_game_ids.remove(game_id)
+
+    def _get_visible_range(self) -> tuple[int, int]:
+        """Return (start_index, end_index) of visible games based on scroll position."""
+        scrollbar = self.scroll.verticalScrollBar()
+        if not scrollbar:
+            return 0, len(self._all_game_ids)
+
+        # Estimate which items are visible based on scroll position
+        # Each card is approximately CARD_HEIGHT pixels tall
+        offset = scrollbar.value()
+        page_size = scrollbar.pageStep()
+
+        start = max(0, offset // CARD_HEIGHT - VIRTUAL_BUFFER)
+        # Add buffer items
+        visible_count = max(1, (page_size // CARD_HEIGHT) + 2 * VIRTUAL_BUFFER)
+        end = min(len(self._all_game_ids), start + visible_count)
+
+        return start, end
+
+    def eventFilter(self, obj, event):
+        """Intercept resize events on the scroll area to trigger card sync."""
+        if obj is self.scroll and event.type() == QEvent.Resize:
+            if len(self._all_game_ids) > self._VIRTUAL_SCROLL_THRESHOLD:
+                QTimer.singleShot(0, self._sync_visible_cards)
+        return super().eventFilter(obj, event)
+
+    def _sync_visible_cards(self):
+        """Sync cards to match current viewport visibility."""
+        if len(self._all_game_ids) <= self._VIRTUAL_SCROLL_THRESHOLD:
+            return
+
+        visible_start, visible_end = self._get_visible_range()
+
+        # Create cards for newly visible items
+        for i in range(visible_start, min(visible_end, len(self._all_game_ids))):
+            game_id = self._all_game_ids[i]
+            if game_id not in self.cards:
+                game = self.games[game_id]
+                self._add_card_for_game(game)
+
+        # Clean up cards that are far out of view
+        buffer_zone = VIRTUAL_BUFFER + 5
+        keep_start = max(0, visible_start - buffer_zone)
+        keep_end = min(len(self._all_game_ids), visible_end + buffer_zone)
+        ids_to_keep = set(self._all_game_ids[keep_start:keep_end])
+
+        ids_to_remove = [
+            gid for gid in self.cards.keys() if gid not in ids_to_keep
+        ]
+        for game_id in ids_to_remove:
+            card = self.cards.pop(game_id)
+            self.list_layout.removeWidget(card)
+            card.deleteLater()
+
+    def _on_scroll(self, value: int):
+        """Handle scroll events for virtual scrolling."""
+        self._sync_visible_cards()
 
     # ---------------- status / scanning ----------------
     #
@@ -324,22 +413,26 @@ class MainWindow(QMainWindow):
             )
 
     def _update_backup_all_button(self):
-        changed_count = sum(1 for s in self.status_cache.values() if s == "changed")
-        self.backup_all_btn.setEnabled(changed_count > 0)
+        # Games needing backup: either changed saves or never backed up
+        needing = sum(1 for s in self.status_cache.values() if s in ("changed", "never"))
+        self.backup_all_btn.setEnabled(needing > 0)
         self.backup_all_btn.setText(
-            f"Backup All ({changed_count})" if changed_count > 0 else "Backup All"
+            f"Backup All ({needing})" if needing > 0 else "Backup All"
         )
 
     def _update_banner_from_cache(self):
-        changed_names = [g.name for g in self.games.values() if self.status_cache.get(g.id) == "changed"]
-        self._update_banner(changed_names)
+        needing_names = [
+            g.name for g in self.games.values()
+            if self.status_cache.get(g.id) in ("changed", "never")
+        ]
+        self._update_banner(needing_names)
 
     def _update_banner(self, changed_games: list):
         if changed_games:
             names = ", ".join(changed_games[:4])
             extra = f" and {len(changed_games) - 4} more" if len(changed_games) > 4 else ""
             self.banner_label.setText(
-                f"Unsaved progress detected in: {names}{extra}. Consider backing up now."
+                f"Games needing backup: {names}{extra}. Consider backing up now."
             )
             self.banner.setVisible(True)
         else:
@@ -549,27 +642,26 @@ class MainWindow(QMainWindow):
     # ---------------- backup flow ----------------
 
     def _on_backup_all(self):
-        changed_ids = [
+        # Back up games that have new changes OR have never been backed up
+        needing = [
             game_id for game_id, status in self.status_cache.items()
-            if status == "changed" and game_id not in self.workers
+            if status in ("changed", "never") and game_id not in self.workers
         ]
-        if not changed_ids:
-            self.status_bar.showMessage("No changed saves to back up right now.", 4000)
+        if not needing:
+            self.status_bar.showMessage("No saves need backing up right now.", 4000)
             return
 
-        # Disable the button while starting backups to prevent re-entry
-        # (e.g., user clicking "Backup All" again while backups are starting)
         self.backup_all_btn.setEnabled(False)
 
         # Queue up the backup requests so we don't have reentrancy issues
         # if any backup finishes very quickly during the loop
-        pending = list(changed_ids)
+        pending = list(needing)
 
         def start_next():
             if not pending:
                 self.backup_all_btn.setEnabled(True)
                 self._update_backup_all_button()
-                self.status_bar.showMessage(f"Backing up {len(changed_ids)} game(s)…", 4000)
+                self.status_bar.showMessage(f"Backing up {len(needing)} game(s)…", 4000)
                 return
             game_id = pending.pop(0)
             self._on_backup_requested(game_id)
