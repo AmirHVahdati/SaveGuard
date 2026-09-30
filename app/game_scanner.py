@@ -85,6 +85,39 @@ _DOCUMENTS_EXCLUDE = {
     "sql server management studio", "adobe", "corel", "autodesk",
     "obsidian", "notion", "minecraft", "steam", "epic games", "ubisoft",
     "ea app", "xbox games", "windows", "desktop", "downloads", "links",
+    "iisexpress", "megascans library", "megascans", "my websites",
+    "kilo", "clash verge", "clash.verge", "node_modules", "wordpress",
+    "laravel", "django", "react", "angular", "vue", "next.js", "nuxt",
+    "python projects", "source", "src", "projects", "workspace",
+    "godot projects", "unity projects", "unreal", "blender",
+    "obsidian", "notion", "dropbox", "onedrive", "googledrive",
+}
+
+# Game publishers that store saves in Documents\<Publisher>\<Game>\ format.
+# Each subfolder of these folders is treated as a game candidate.
+# (Unlike generic Documents folders which are low-confidence, these are
+# publisher-specific paths we can be confident about.)
+_PUBLISHER_SAVE_FOLDERS = {
+    "capcom",        # Documents\CAPCOM\OnimushaWotS\backup  etc.
+    "koei tecmo",    # Documents\KoeiTecmo\<game>\
+    "koeitecmo",
+    "koei",
+    "tecmo",
+    "konami",        # Documents\Konami\<game>\
+    "square enix",   # Documents\SquareEnix\<game>\
+    "squareenix",
+    "square enix holdings",
+    "bandai namco",  # Documents\Bandai Namco\<game>\
+    "bandainamco",
+    "bandai",
+    "namco",
+    "bethesda",      # Documents\Bethesda\<game>\ (less common)
+    "sega",
+    "capcom entertainment",
+    "miHoYo",        # Genshin, Honkai — some saves in Documents
+    "HoYoverse",
+    "Honkai",
+    "genshin impact",
 }
 
 # Common non-game folders directly under AppData\Local — mostly OS and
@@ -243,6 +276,45 @@ def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
     return results
 
 
+def _get_documents_paths(home: str) -> List[str]:
+    """Returns all possible Documents paths — standard plus OneDrive redirect.
+    On Windows, the Documents folder is frequently redirected to OneDrive,
+    so we check both locations."""
+    paths = [os.path.join(home, "Documents")]
+    onedrive_docs = os.path.join(home, "OneDrive", "Documents")
+    if onedrive_docs not in paths:
+        paths.append(onedrive_docs)
+    return paths
+
+
+def scan_publisher_style(documents_root: str) -> List[ScanCandidate]:
+    """Some publishers store saves in Documents\\<Publisher>\\<Game>\\ rather
+    than the 'My Games' convention. This scanner finds those known publisher
+    folders and resolves the actual per-game save paths using
+    _resolve_game_folders (which handles the extra nesting layer some games
+    add, e.g. Documents\\CAPCOM\\OnimushaWotS\\backup\\)."""
+    results = []
+    for sub in _list_subdirs(documents_root):
+        name = os.path.basename(sub).lower()
+        if name not in _PUBLISHER_SAVE_FOLDERS:
+            continue
+        # For each known publisher folder, resolve its sub-folders as games.
+        # Use max_depth=3 to handle deeper nesting like:
+        # Publisher -> Game -> Saves -> *.sav
+        game_subs = _list_subdirs(sub)
+        for game_folder in game_subs:
+            resolved = _resolve_game_folders(game_folder, max_depth=3)
+            for save_path in resolved:
+                if _has_any_files(save_path):
+                    results.append(ScanCandidate(
+                        name=os.path.basename(save_path) or os.path.basename(game_folder),
+                        save_path=save_path,
+                        source=os.path.basename(sub).title(),
+                        confidence="high",
+                    ))
+    return results
+
+
 def scan_documents_style(documents_root: str) -> List[ScanCandidate]:
     """Documents itself holds all sorts of non-game folders, so results here
     are always low-confidence and meant to be reviewed before adding."""
@@ -250,6 +322,10 @@ def scan_documents_style(documents_root: str) -> List[ScanCandidate]:
     for sub in _list_subdirs(documents_root):
         name = os.path.basename(sub)
         if name.lower() in _DOCUMENTS_EXCLUDE:
+            continue
+        # Skip publisher folders — handled by scan_publisher_style which does
+        # deeper resolution into the actual per-game save paths.
+        if name.lower() in _PUBLISHER_SAVE_FOLDERS:
             continue
         if not _has_any_files(sub):
             continue
@@ -494,9 +570,18 @@ def discover_candidates(
     if os.path.isdir(saved_games):
         candidates += scan_flat_style(saved_games, "Saved Games")
 
-    documents = os.path.join(home, "Documents")
-    if os.path.isdir(documents):
-        candidates += scan_documents_style(documents)
+    # Check both standard Documents and OneDrive Documents paths
+    for documents in _get_documents_paths(home):
+        if os.path.isdir(documents):
+            candidates += scan_publisher_style(documents)
+            candidates += scan_documents_style(documents)
+            # Also check My Games and Saved Games under OneDrive
+            onedrive_my_games = os.path.join(documents, "My Games")
+            if os.path.isdir(onedrive_my_games) and onedrive_my_games != my_games:
+                candidates += scan_flat_style(onedrive_my_games, "My Games")
+            onedrive_saved_games = os.path.join(documents, "Saved Games")
+            if os.path.isdir(onedrive_saved_games) and onedrive_saved_games != saved_games:
+                candidates += scan_flat_style(onedrive_saved_games, "Saved Games")
 
     if os.path.isdir(appdata_local):
         candidates += scan_appdata_style(appdata_local)

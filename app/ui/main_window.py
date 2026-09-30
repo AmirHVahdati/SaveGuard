@@ -277,6 +277,20 @@ class MainWindow(QMainWindow):
         card.color_changed.connect(self._on_color_changed)
         self.cards[game.id] = card
 
+        # Track in _all_game_ids for virtual scrolling (insert at correct
+        # sorted position so the list stays ordered by game name)
+        if game.id not in self._all_game_ids:
+            target_name = game.name.lower()
+            inserted = False
+            for i, gid in enumerate(self._all_game_ids):
+                existing_game = self.games.get(gid)
+                if existing_game and existing_game.name.lower() > target_name:
+                    self._all_game_ids.insert(i, game.id)
+                    inserted = True
+                    break
+            if not inserted:
+                self._all_game_ids.append(game.id)
+
         # Insert in sorted position to maintain ordering without full rebuild
         insert_pos = 0
         target_name = game.name.lower()
@@ -406,10 +420,10 @@ class MainWindow(QMainWindow):
         self._flush_status_update()
 
     def _show_startup_summary(self):
-        changed = [g.name for g in self.games.values() if self.status_cache.get(g.id) == "changed"]
-        if changed:
+        needing = [g.name for g in self.games.values() if self.status_cache.get(g.id) in ("changed", "never")]
+        if needing:
             self.status_bar.showMessage(
-                f"Welcome back — {len(changed)} game(s) have new save data.", 6000
+                f"Welcome back — {len(needing)} game(s) need a backup.", 6000
             )
 
     def _update_backup_all_button(self):
