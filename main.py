@@ -7,13 +7,18 @@ Requires:  PySide6
 import sys
 import traceback
 from datetime import datetime
+from typing import Optional
 
+from PySide6.QtCore import QThread, Signal, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.ui.main_window import MainWindow
 from app.styles import STYLE_SHEET
 from app.assets import load_app_icon
 from app.config import APP_DIR, ensure_app_dir
+from app.updater import check_for_updates, fetch_release_notes
+from app import __version__
 
 
 def _install_exception_hook():
@@ -70,6 +75,52 @@ def _set_windows_app_id():
             pass  # cosmetic only -- never worth failing startup over
 
 
+def _check_for_update_startup(window):
+    """Check for updates on startup. If a new version is available, show
+    a non-blocking modal dialog asking if the user wants to update."""
+    global _startup_update_worker
+    _startup_update_worker = _StartupUpdateWorker()
+    _startup_update_worker.result.connect(lambda info: _show_update_dialog(window, info))
+    _startup_update_worker.finished.connect(_startup_update_worker.deleteLater)
+    _startup_update_worker.start()
+
+
+def _show_update_dialog(window, release_info):
+    if release_info is None:
+        return
+
+    notes = fetch_release_notes(release_info.version)
+    msg = (
+        f"A new version of SaveGuard (v{release_info.version}) is available.\n\n"
+        f"You're currently on v{__version__}. Would you like to open the "
+        "release page in your browser to download it?"
+    )
+    if notes:
+        msg += f"\n\nWhat's new:\n{notes[:500]}"
+    reply = QMessageBox.question(
+        window,
+        "Update Available",
+        msg,
+        QMessageBox.Yes | QMessageBox.No,
+    )
+    if reply == QMessageBox.Yes:
+        QDesktopServices.openUrl(QUrl(release_info.url))
+
+
+class _StartupUpdateWorker(QThread):
+    result = Signal(object)
+
+    def run(self):
+        try:
+            release = check_for_updates(force=False)
+        except Exception:
+            release = None
+        self.result.emit(release)
+
+
+_startup_update_worker: Optional[_StartupUpdateWorker] = None
+
+
 def main():
     _install_exception_hook()
     _set_windows_app_id()
@@ -82,6 +133,8 @@ def main():
 
     window = MainWindow()
     window.show()
+
+    QTimer.singleShot(1500, lambda: _check_for_update_startup(window))
 
     sys.exit(app.exec())
 

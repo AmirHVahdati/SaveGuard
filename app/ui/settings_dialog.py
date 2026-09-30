@@ -4,15 +4,18 @@ redesign this dialog — today there's a "Backups" tab and an "About" tab."""
 
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTabWidget, QWidget, QSlider, QLineEdit, QFileDialog, QFrame, QSpinBox
+    QTabWidget, QWidget, QSlider, QLineEdit, QFileDialog, QFrame, QSpinBox,
+    QMessageBox
 )
 
 from app import __version__
 from app.assets import load_icon_pixmap
 from app.config import APP_DIR
+from app.updater import check_for_updates, fetch_release_notes
 from app.utils import clamp_compression_level, clamp_max_backups
 
 
@@ -198,6 +201,16 @@ class SettingsDialog(QDialog):
         version_label.setAlignment(Qt.AlignHCenter)
         version_label.setStyleSheet("color: #8b90a3; font-size: 12px;")
         layout.addWidget(version_label)
+
+        update_row = QHBoxLayout()
+        update_row.addStretch()
+        self.update_btn = QPushButton("Check for Updates")
+        self.update_btn.setMinimumHeight(32)
+        self.update_btn.setMinimumWidth(140)
+        self.update_btn.clicked.connect(self._on_check_updates)
+        update_row.addWidget(self.update_btn)
+        update_row.addStretch()
+        layout.addLayout(update_row)
         layout.addSpacing(14)
 
         tagline = QLabel("A backup utility for gamers who don't use Steam Cloud "
@@ -266,3 +279,56 @@ class SettingsDialog(QDialog):
 
         self.result_settings = self.settings
         self.accept()
+
+    def _on_check_updates(self):
+        """Run an update check in a background thread and show the result."""
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Checking…")
+
+        worker = _UpdateCheckWorker()
+        worker.result.connect(self._handle_update_check_result)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self._update_worker = worker
+
+    def _handle_update_check_result(self, release_info):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("Check for Updates")
+
+        if release_info is None:
+            QMessageBox.information(
+                self,
+                "Up to Date",
+                f"SaveGuard {__version__} is the latest version.",
+            )
+            return
+
+        notes = fetch_release_notes(release_info.version)
+        msg = (
+            f"A new version (v{release_info.version}) is available.\n\n"
+            f"You're currently on v{__version__}.\n\n"
+            "Would you like to open the release page in your browser?"
+        )
+        if notes:
+            msg += f"\n\nRelease notes:\n{notes[:500]}"
+        reply = QMessageBox.question(
+            self,
+            "Update Available",
+            msg,
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(release_info.url))
+
+
+class _UpdateCheckWorker(QThread):
+    """Runs check_for_updates() on a background thread so the dialog
+    doesn't freeze during the network request."""
+    result = Signal(object)
+
+    def run(self):
+        try:
+            release = check_for_updates(force=True)
+        except Exception:
+            release = None
+        self.result.emit(release)
