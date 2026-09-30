@@ -31,7 +31,7 @@ from app.ui.settings_dialog import SettingsDialog
 # TODO: replace with the real donation page once it exists. Wired up now so
 # the button ships in 1.0 and just needs this one string updated later —
 # nothing else in the app depends on this being a placeholder.
-SUPPORT_URL = "https://donatr.ee/REPLACE_WITH_REAL_LINK"
+SUPPORT_URL = "https://donatr.ee/amirvahdati/"
 
 # Number of extra items to render above/below the visible viewport as a buffer
 # so cards don't pop in/out abruptly while scrolling.

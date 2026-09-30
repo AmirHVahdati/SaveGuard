@@ -83,6 +83,8 @@ _DOCUMENTS_EXCLUDE = {
     "visual studio 2019", "visual studio 2022", "power bi desktop",
     "wechat files", "bluej", "arduino", "zoom", "fiddler2",
     "sql server management studio", "adobe", "corel", "autodesk",
+    "obsidian", "notion", "minecraft", "steam", "epic games", "ubisoft",
+    "ea app", "xbox games", "windows", "desktop", "downloads", "links",
 }
 
 # Common non-game folders directly under AppData\Local — mostly OS and
@@ -101,6 +103,7 @@ _APPDATA_EXCLUDE = {
     "obs studio", "virtualbox", "vmware", "dropbox", "box", "evernote",
     "skype", "microsoft teams", "webex", "citrix", "teamviewer", "anydesk",
     "malwarebytes", "ccleaner", "winrar", "7-zip", "vlc", "corel",
+    "roblox", "epic games", "steam", "ubisoft", "ea app", "xbox",
 }
 
 # Common non-game folders directly under ~/.local/share on a typical Linux
@@ -143,6 +146,7 @@ _XDG_CONFIG_EXCLUDE = {
 _SAVE_FOLDER_KEYWORDS = {
     "save", "saves", "savegame", "savegames", "saved games", "savedgames",
     "savedata", "save_data", "save data", "gamesave", "gamesaves",
+    "player", "players",
 }
 
 
@@ -159,11 +163,26 @@ def _list_subdirs(path: str) -> List[str]:
 def _has_any_files(path: str, max_check: int = 1) -> bool:
     """Cheap existence check — stops at the first file found instead of
     walking the whole tree, since we only need a yes/no answer."""
+    stack = [path]
     found = 0
-    for _dirpath, _dirnames, filenames in os.walk(path):
-        found += len(filenames)
-        if found >= max_check:
-            return True
+    checked = 0
+    while stack:
+        current = stack.pop()
+        checked += 1
+        if checked > 500:
+            return True  # safety: if we've checked many dirs without finding a
+                         # file, the folder is likely non-game; bail out early
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False) and not entry.name.startswith("."):
+                        found += 1
+                        if found >= max_check:
+                            return True
+                    elif entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                        stack.append(entry.path)
+        except OSError:
+            continue
     return False
 
 
@@ -231,6 +250,8 @@ def scan_documents_style(documents_root: str) -> List[ScanCandidate]:
     for sub in _list_subdirs(documents_root):
         name = os.path.basename(sub)
         if name.lower() in _DOCUMENTS_EXCLUDE:
+            continue
+        if not _has_any_files(sub):
             continue
         results.append(ScanCandidate(
             name=name, save_path=sub, source="Documents", confidence="low",

@@ -34,7 +34,7 @@ class ScanResultsDialog(QDialog):
         subtitle = QLabel(
             "Scanned common save locations — Documents, AppData, Steam, Proton "
             "game prefixes, and Linux config/data folders. Review the list "
-            "below — uncheck anything that isn't actually a game before adding."
+            "and check the games you want to start tracking."
         )
         subtitle.setStyleSheet("color: #8b90a3; font-size: 12px;")
         subtitle.setWordWrap(True)
@@ -89,7 +89,7 @@ class ScanResultsDialog(QDialog):
         layout.setSpacing(10)
 
         checkbox = QCheckBox()
-        checkbox.setChecked(candidate.confidence == "high")
+        checkbox.setChecked(False)  # let user select which games to track
         checkbox.stateChanged.connect(self._update_add_button_text)
         layout.addWidget(checkbox)
 

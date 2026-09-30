@@ -1,4 +1,4 @@
-"""SaveGuard - a launcher-free game save backup utility.
+"""SaveGuard - a game save backup utility.
 
 Run with:  python main.py
 Requires:  PySide6
