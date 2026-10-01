@@ -8,20 +8,65 @@ def sanitize_folder_name(name: str) -> str:
     return cleaned or "Game"
 
 
+def path_key(path: str) -> str:
+    """Canonical comparison key for "are these the same directory, or is one
+    inside the other" questions. Single source of truth for every such
+    comparison in the app.
+
+    Resolves links via os.path.realpath, not os.path.abspath, and that
+    distinction is load-bearing rather than pedantic. os.walk *follows* a
+    symlinked or junctioned save folder into its real target, so a key
+    built from abspath compares "...\\savelink\\backups" against
+    "...\\real_save\\backups", never matches, and silently fails to prune
+    the backup destination -- letting each backup zip the previous one,
+    growing without bound. Verified: a save folder reached through a
+    junction bypassed the conflict check entirely, because abspath left
+    the link in the string while the walk had already stepped through it.
+
+    realpath also normalizes as it goes, so normpath/abspath calls around
+    it are redundant. Paths that don't exist yet still resolve their
+    existing prefix, which is all a pre-creation comparison needs.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _contains(outer: str, inner: str) -> bool:
+    """True if `inner` is `outer` itself or lives somewhere beneath it.
+
+    The trailing separator is only appended when it isn't already there.
+    normpath keeps exactly one on a filesystem root, so appending os.sep
+    unconditionally produced a doubled separator ('C:\\\\', '//') that no
+    real path can start with -- which silently reported "no conflict" for
+    a save folder and a backup destination sitting either side of a root
+    (C:\\ vs C:\\foo, / vs /foo). Those are ordinary layouts, not
+    hypotheticals: a Proton prefix root or a Steam library root is a
+    plausible parent for a save folder.
+    """
+    if inner == outer:
+        return True
+    if not outer.endswith(os.sep):
+        outer += os.sep
+    return inner.startswith(outer)
+
+
 def paths_conflict(path_a: str, path_b: str) -> bool:
     """True if path_a and path_b are the same directory, or if one is
     nested inside the other. Used to catch a save folder and backup
     destination that would make a backup include itself — confirmed this
     actually happens: each new backup would walk right past its own prior
-    archives and zip them up inside itself, growing without bound."""
+    archives and zip them up inside itself, growing without bound.
+
+    Call this at the moment the paths are about to be used, not only when
+    they're first entered: BackupWorker re-checks before walking (see
+    backup_worker.run), because a destination validated in the Add/Edit
+    dialog can still be nested inside the save folder by the time the
+    background backup thread actually starts."""
     try:
-        a = os.path.normcase(os.path.normpath(os.path.abspath(path_a)))
-        b = os.path.normcase(os.path.normpath(os.path.abspath(path_b)))
+        a = path_key(path_a)
+        b = path_key(path_b)
     except (OSError, ValueError):
         return False
-    if a == b:
-        return True
-    return a.startswith(b + os.sep) or b.startswith(a + os.sep)
+    return _contains(a, b) or _contains(b, a)
 
 
 def mark_visited(visited: set, path: str) -> bool:

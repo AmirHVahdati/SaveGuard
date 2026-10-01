@@ -22,7 +22,10 @@ from datetime import datetime
 from PySide6.QtCore import QThread, Signal
 
 from app.scanner import build_snapshot
-from app.utils import clamp_compression_level, clamp_max_backups, mark_visited
+from app.utils import (
+    clamp_compression_level, clamp_max_backups, mark_visited, path_key,
+    paths_conflict,
+)
 
 # Default if no compression_level setting is passed in: zlib's own default
 # level — negligible speed difference from level 1 on typical save-folder
@@ -31,11 +34,14 @@ from app.utils import clamp_compression_level, clamp_max_backups, mark_visited
 DEFAULT_COMPRESS_LEVEL = 6
 
 # Matches the exact filename format backups are written with (see run()
-# below). Used to recognize SaveGuard's own previous backups if the backup
-# destination happens to sit inside the save folder being backed up —
-# without this, each new backup would walk right past its own prior
-# archives sitting in that folder and zip them up inside itself, growing
-# without bound on every run.
+# below). Used to enumerate a game's own archives on disk for retention
+# pruning (_prune_old_backups).
+#
+# It used to double as a guard against a backup destination nested inside
+# the save folder -- each new backup walking past its own prior archives and
+# zipping them up inside itself, growing without bound. That case is now
+# refused outright by the paths_conflict check in run(), and the destination
+# is pruned from the walk, so this pattern is no longer load-bearing for it.
 _BACKUP_FILENAME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.zip$")
 
 
@@ -94,7 +100,7 @@ def _is_forbidden_save_path(path: str) -> bool:
     something unexpected.
     """
     try:
-        normalized = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        normalized = path_key(path)
     except (OSError, ValueError):
         return True  # can't even resolve it -- refuse rather than guess
 
@@ -116,7 +122,7 @@ def _is_forbidden_save_path(path: str) -> bool:
     ):
         base = os.environ.get(env_var) or fallback
         try:
-            if normalized == os.path.normcase(os.path.normpath(os.path.abspath(base))):
+            if normalized == path_key(base):
                 return True
         except (OSError, ValueError):
             continue
@@ -168,24 +174,46 @@ class BackupWorker(QThread):
             if not self.backup_root:
                 self.error.emit(self.game_id, "No backup destination configured.")
                 return
+            # Re-checked here, not just in the Add/Edit dialog. That dialog
+            # validates at selection time, but this walk happens later on a
+            # background thread -- a folder can be moved, renamed, replaced
+            # with a link, or a tracked game loaded from a hand-edited
+            # games.json in between. Walking a save folder that contains its
+            # own backup destination is the unbounded-growth case, so the
+            # check has to hold at the moment of use rather than when the
+            # path was typed.
+            if paths_conflict(self.save_path, self.backup_root):
+                self.error.emit(
+                    self.game_id,
+                    f"“{self.game_name}” can't be backed up: its backup "
+                    f"destination is the same as, or inside, its save "
+                    f"folder.\n\nSave folder: {self.save_path}\n"
+                    f"Backup destination: {self.backup_root}\n\n"
+                    "Please pick a separate destination from Edit.",
+                )
+                return
 
             os.makedirs(self.backup_root, exist_ok=True)
 
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             zip_path = os.path.join(self.backup_root, f"{timestamp}.zip")
 
-            # Only relevant if the backup destination happens to sit inside
-            # (or exactly at) the save folder — see the constant's comment
-            # above for why this matters.
-            backup_root_abs = os.path.normcase(os.path.normpath(os.path.abspath(self.backup_root)))
+            # Normally outside the save folder entirely, since a conflicting
+            # destination was just refused above — kept as containment that
+            # doesn't depend on that check holding. Keyed with path_key, like
+            # the conflict test above, so it still matches when the save
+            # folder is reached through a symlink or junction.
+            backup_root_abs = path_key(self.backup_root)
 
             files = []
-            # Cycle guard, applied by pruning dirnames in place so os.walk
-            # never descends into a directory it has already seen. This is
-            # needed because os.walk's own followlinks=False (the default
-            # here) does NOT catch a Windows junction: islink() is False
-            # for one, so a junction pointing back at its own ancestor
-            # makes the walk recurse forever -- see mark_visited.
+            # Cycle guard and destination pruning, both applied by editing
+            # dirnames in place so os.walk never descends into anything
+            # skipped here. A directory is dropped when it's hidden, when it
+            # has already been visited (a Windows junction pointing at its
+            # own ancestor -- see mark_visited), or when it IS the backup
+            # destination. Pruning the destination wholesale means nothing
+            # inside it can reach the archive, rather than only the
+            # timestamped archives this app recognises.
             visited_dirs: set = set()
             mark_visited(visited_dirs, self.save_path)
             for dirpath, dirnames, filenames in os.walk(self.save_path):
@@ -193,8 +221,8 @@ class BackupWorker(QThread):
                     d for d in dirnames
                     if not d.startswith(".")
                     and mark_visited(visited_dirs, os.path.join(dirpath, d))
+                    and path_key(os.path.join(dirpath, d)) != backup_root_abs
                 ]
-                in_backup_root = os.path.normcase(os.path.normpath(os.path.abspath(dirpath))) == backup_root_abs
                 for fname in filenames:
                     if fname.startswith("."):
                         continue
@@ -206,8 +234,6 @@ class BackupWorker(QThread):
                     # alters the backup without ever being detected as a change.
                     if os.path.islink(os.path.join(dirpath, fname)):
                         continue
-                    if in_backup_root and _BACKUP_FILENAME_PATTERN.match(fname):
-                        continue  # one of our own previous backups, not save data
                     files.append(os.path.join(dirpath, fname))
 
             compression, compresslevel = _compression_for_level(self.compression_level)
