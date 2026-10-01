@@ -65,6 +65,65 @@ def _compression_for_level(level: int):
     return zipfile.ZIP_DEFLATED, level
 
 
+# Top-level POSIX system directories that must never be accepted as a game
+# save folder. Compared after normalization/case-folding, so "/etc",
+# "/etc/" and "/etc/." all match.
+_POSIX_SYSTEM_DIRS = {
+    "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64",
+    "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/srv",
+    "/sys", "/usr", "/var",
+}
+
+
+def _is_forbidden_save_path(path: str) -> bool:
+    """True if `path` is a filesystem root or a well-known system directory
+    that should never be treated as a game's save folder.
+
+    A save folder is one game's save data, so pointing this at an OS root
+    or a top-level system directory means "back it up" would walk tens of
+    thousands of unrelated files and try to squeeze them all into a single
+    archive — at best a multi-hour hang, at worst filling the disk. Caught
+    here, up front, instead of being discovered halfway through a doomed
+    archive.
+
+    Deliberately a short, fixed list rather than anything clever about
+    recognising "real" save folders: the goal is only to stop the
+    catastrophic case, not to second-guess legitimate save folders, which
+    can live anywhere the user likes. An unresolvable path counts as
+    forbidden so a broken value fails loudly instead of silently walking
+    something unexpected.
+    """
+    try:
+        normalized = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except (OSError, ValueError):
+        return True  # can't even resolve it -- refuse rather than guess
+
+    # A filesystem root ("C:\", "/", "\\\\server\\share\") is its own parent.
+    # Its dirname is itself, so this catches archiving an entire volume.
+    if os.path.dirname(normalized) == normalized:
+        return True
+
+    if normalized in _POSIX_SYSTEM_DIRS:
+        return True
+
+    # Windows system roots. Read from the environment when possible so this
+    # follows a non-default install location; the fallbacks only apply on
+    # Windows, and on POSIX they normalize to a path that can't collide with
+    # a real one, so they're harmless there.
+    for env_var, fallback in (
+        ("SystemRoot", r"C:\Windows"),
+        ("ProgramData", r"C:\ProgramData"),
+    ):
+        base = os.environ.get(env_var) or fallback
+        try:
+            if normalized == os.path.normcase(os.path.normpath(os.path.abspath(base))):
+                return True
+        except (OSError, ValueError):
+            continue
+
+    return False
+
+
 class BackupWorker(QThread):
     progress = Signal(str, int, int)             # game_id, current, total
     backup_finished = Signal(str, dict, str, str, int)  # game_id, new_snapshot, backup_time_str, zip_path, backups_remaining
@@ -93,6 +152,18 @@ class BackupWorker(QThread):
         try:
             if not os.path.isdir(self.save_path):
                 self.error.emit(self.game_id, "The save folder path no longer exists.")
+                return
+            # Checked before anything touches the disk below -- os.makedirs on
+            # the backup root and the os.walk of the save folder both become
+            # far more expensive than they look if this path is a system root.
+            if _is_forbidden_save_path(self.save_path):
+                self.error.emit(
+                    self.game_id,
+                    f"“{self.game_name}” has its save folder set to a system "
+                    f"location, which can't be backed up:\n{self.save_path}\n\n"
+                    "Please point it at the specific folder the game writes "
+                    "its saves to.",
+                )
                 return
             if not self.backup_root:
                 self.error.emit(self.game_id, "No backup destination configured.")
