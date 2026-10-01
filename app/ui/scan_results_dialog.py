@@ -6,7 +6,7 @@ Documents and AppData) will occasionally guess wrong."""
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QWidget, QCheckBox, QFrame
+    QScrollArea, QWidget, QCheckBox, QFrame, QMessageBox
 )
 
 
@@ -47,8 +47,12 @@ class ScanResultsDialog(QDialog):
         select_none_btn = QPushButton("Select None")
         select_none_btn.setObjectName("GhostButton")
         select_none_btn.clicked.connect(lambda: self._set_all_checked(False))
+        copy_btn = QPushButton("Copy Results")
+        copy_btn.setObjectName("GhostButton")
+        copy_btn.clicked.connect(self._on_copy_results)
         select_row.addWidget(select_all_btn)
         select_row.addWidget(select_none_btn)
+        select_row.addWidget(copy_btn)
         select_row.addStretch()
         root.addLayout(select_row)
 
@@ -127,3 +131,15 @@ class ScanResultsDialog(QDialog):
     def _on_add_clicked(self):
         self.selected_candidates = [c for cb, c in self.checkboxes if cb.isChecked()]
         self.accept()
+
+    def _on_copy_results(self):
+        """Copy all scan results to clipboard as text that can be pasted
+        into a bug report or chat message."""
+        from PySide6.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        lines = []
+        for c in self.candidates:
+            lines.append(f"{c.name} | {c.save_path} | {c.source} | {c.confidence}")
+        text = f"Scan Results ({len(self.candidates)} candidates):\n\n" + "\n".join(lines)
+        clipboard.setText(text)
+        QMessageBox.information(self, "Copied", f"Copied {len(self.candidates)} scan results to clipboard.")

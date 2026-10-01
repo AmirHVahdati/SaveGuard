@@ -85,12 +85,14 @@ _DOCUMENTS_EXCLUDE = {
     "sql server management studio", "adobe", "corel", "autodesk",
     "obsidian", "notion", "minecraft", "steam", "epic games", "ubisoft",
     "ea app", "xbox games", "windows", "desktop", "downloads", "links",
-    "iisexpress", "megascans library", "megascans", "my websites",
+    "iisexpress", "megascans library", "megascans", "my websites", "my web sites",
     "kilo", "clash verge", "clash.verge", "node_modules", "wordpress",
     "laravel", "django", "react", "angular", "vue", "next.js", "nuxt",
     "python projects", "source", "src", "projects", "workspace",
-    "godot projects", "unity projects", "unreal", "blender",
-    "obsidian", "notion", "dropbox", "onedrive", "googledrive",
+    "godot projects", "unity projects", "unreal projects", "unreal",
+    "blender", "dropbox", "googledrive", "steam", "skidrow",
+    "rainmeter", "sound recordings", "zarf", "saved games",
+    "sports interactive", "paradox interactive", "cd projekt", "cd projekt red",
 }
 
 # Game publishers that store saves in Documents\<Publisher>\<Game>\ format.
@@ -98,7 +100,7 @@ _DOCUMENTS_EXCLUDE = {
 # (Unlike generic Documents folders which are low-confidence, these are
 # publisher-specific paths we can be confident about.)
 _PUBLISHER_SAVE_FOLDERS = {
-    "capcom",        # Documents\CAPCOM\OnimushaWotS\backup  etc.
+    "capcom",        # Documents\CAPCOM\OnimushaWotS\backup
     "koei tecmo",    # Documents\KoeiTecmo\<game>\
     "koeitecmo",
     "koei",
@@ -111,10 +113,35 @@ _PUBLISHER_SAVE_FOLDERS = {
     "bandainamco",
     "bandai",
     "namco",
-    "bethesda",      # Documents\Bethesda\<game>\ (less common)
+    "bethesda",      # Documents\Bethesda\<game>\
+    "arkane studios",  # Saved Games\Arkane Studios\<game>\
+    "id software",     # Saved Games\id Software\<game>\
+    "gamefreak",      # Saved Games\Gamefreak\<game>\
     "sega",
     "capcom entertainment",
-    "miHoYo",        # Genshin, Honkai — some saves in Documents
+    "cd projekt",    # Documents\CD Projekt\<game>\
+    "cd projekt red",
+    "paradox interactive",  # Documents\Paradox Interactive\<game>\
+    "paradox",
+    "sports interactive",  # Documents\Sports Interactive\<game>\
+    "warner bros. interactive entertainment",
+    "warner bros",
+    "warner bros.",
+    "electronic arts",
+    "ea",
+    "take 2 interactive",
+    "take 2",
+    "activision blizzard",
+    "activision",
+    "blizzard",
+    "thq nordic",
+    "thq",
+    "deep silver",
+    "gearbox entertainment",
+    "gearbox",
+    "2k games",
+    "2k",
+    "miHoYo",        # Genshin, Honkai
     "HoYoverse",
     "Honkai",
     "genshin impact",
@@ -152,7 +179,7 @@ _XDG_DATA_EXCLUDE = {
     "tracker3", "zeitgeist", "evolution", "gvfs", "recently-used.xbel",
     "steam", "lutris", "wineprefixes", "man", "backgrounds",
     "spotify", "slack", "zoom", "dropbox", "obs-studio", "vlc",
-    "teamviewer", "anydesk", "1password",
+    "teamviewer", "anydesk", "1password", "kilo", "clash-verge", "clash_verge",
 }
 
 # Common non-game folders directly under ~/.config on a typical Linux
@@ -165,7 +192,8 @@ _XDG_CONFIG_EXCLUDE = {
     "steam", "lutris", "user-dirs.dirs", "user-dirs.locale",
     "kwinrc", "kglobalshortcutsrc", "khotkeysrc", "baloofilerc",
     "mimeapps.list", "spotify", "slack", "zoom", "dropbox", "obs-studio",
-    "vlc", "teamviewer", "anydesk", "1password",
+    "vlc", "teamviewer", "anydesk", "1password", "kilo", "clash-verge",
+    "cagent", "cagent-updater",
 }
 
 # Nested folder names (anywhere within a couple levels) that suggest "this
@@ -191,6 +219,259 @@ def _list_subdirs(path: str) -> List[str]:
         ]
     except OSError:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Piracy/emulator save scanners
+#
+# Many games (both cracked and legitimately played through emulators like
+# Goldberg/LibreVR) store saves in non-standard locations. These scanners
+# look for those specific folders so the user doesn't have to add them
+# manually. Each entry maps a group name to its known save directories.
+# ---------------------------------------------------------------------------
+
+def _list_subdirs_hidden(path: str) -> List[str]:
+    """Like _list_subdirs but includes hidden directories (names starting with .).
+    Needed for folders like %APPDATA%/.1911 (Razor1911 saves)."""
+    try:
+        return [
+            entry.path for entry in os.scandir(path)
+            if entry.is_dir(follow_symlinks=False)
+        ]
+    except OSError:
+        return []
+
+
+# Known piracy/emulator save locations that follow a simple structure:
+# the base folder contains per-game subfolders.
+# Format: (env_var_name, relative_path, group_label, include_hidden_dirs)
+_PIRACY_SAVE_LOCATIONS = [
+    ("APPDATA", "GSE Saves", "Goldberg Fork", False),
+    ("APPDATA", "Goldberg SteamEmu Saves", "Goldberg", False),
+    ("PUBLIC", os.path.join("Documents", "OnlineFix"), "OnlineFix", False),
+    ("APPDATA", "EMPRESS", "EMPRESS", False),
+    ("APPDATA", os.path.join("Steam", "CODEX"), "CODEX", False),
+    ("LOCALAPPDATA", "skidrow", "SkidRow", False),
+    ("APPDATA", "SmartSteamEmu", "SmartSteamEmu", False),
+    ("APPDATA", ".1911", "Razor1911", True),  # hidden dot-folder
+    ("APPDATA", "FLT", "FLT", False),
+]
+
+
+def _resolve_env_path(env_var: str, relative_path: str = "") -> Optional[str]:
+    """Resolve a path using an environment variable (APPDATA, LOCALAPPDATA, etc.).
+    Returns None on non-Windows platforms or if the env var is unset."""
+    if sys.platform.startswith("win"):
+        base = os.environ.get(env_var)
+        if base:
+            return os.path.join(base, relative_path) if relative_path else base
+    return None
+
+
+# Folder names that appear inside game save directories but definitely aren't
+# save folders (used in piracy/emulator scanners to filter out config-only folders)
+_NON_GAME_SUBFOLDERS = {
+    "settings", "config", "configs", "logs", "log", "readme", "readmes",
+    "screenshots", "shader", "shaders", "texturecache", "cache",
+    "crashdumps", "crash dumps", "backup", "backups",
+    "metadata", "temp", "tmp", "benchmarkresults", "editordata",
+    "exportedteams", "languages", "skins", "tactics",
+    "profiles", "profile",
+}
+
+# Known non-game folders that appear under My Games / Saved Games
+# and should be skipped by scan_flat_style (they're engine/system folders,
+# not per-game saves).
+_NON_GAME_FLAT_FOLDERS = {
+    "unrealengine", "unrealengine4", "unrealengine5", "ue4", "ue5",
+    "unity", "unitycache", "unity hub",
+    "modorganizer", "mod manager", "modmanager",
+    "launcher", "launchers", "bethesdaprebypass",
+    "common", "shaders", "shadercache",
+}
+
+# Known non-game AppIDs that sometimes appear in Steam/Goldberg user data
+_NON_GAME_APPIDS = {
+    "0", "4", "5", "7", "8", "1007", "228980",  # Steam internal components
+    "settings",  # Goldberg config folder
+}
+
+
+def _find_steam_root() -> Optional[str]:
+    """Look for a Steam installation, accounting for common install locations
+    on both Windows and Linux (including Flatpak/Snap paths)."""
+    if sys.platform.startswith("win"):
+        candidates = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("PROGRAMDATA", ""),
+        ]
+        for base in candidates:
+            if not base:
+                continue
+            steam = os.path.join(base, "Steam")
+            if os.path.isdir(os.path.join(steam, "steamapps")):
+                return steam
+    else:
+        candidates = [
+            os.path.join(os.path.expanduser("~"), ".local", "share", "Steam"),
+            os.path.join(os.path.expanduser("~"), ".steam", "steam"),
+            "/var/lib/flatpak/app/com.valvesoftware.Steam/x86_64/active",
+        ]
+        for steam in candidates:
+            if os.path.isdir(os.path.join(steam, "steamapps")):
+                return steam
+    return None
+
+
+def _resolve_appid_name(folder_name: str, app_names_cache: Optional[dict] = None) -> Optional[str]:
+    """If folder_name is a numeric Steam AppID, try to resolve it to the real
+    game name using local Steam appmanifest files. Returns None if the folder
+    name isn't an AppID or no name could be resolved."""
+    if not folder_name.isdigit():
+        return None
+    if folder_name in _NON_GAME_APPIDS:
+        return None
+    if app_names_cache is None:
+        steam_root = _find_steam_root()
+        if not steam_root:
+            return None
+        app_names_cache = _read_steam_app_names(steam_root)
+    return app_names_cache.get(folder_name)
+
+
+def scan_piracy_saves() -> List[ScanCandidate]:
+    """Scan known piracy/emulator save directories for game folders.
+
+    Each supported group (Goldberg, CODEX, SkidRow, etc.) stores saves in a
+    well-known directory — we look there, treat each subfolder as a game, and
+    resolve its actual save path via _resolve_game_folders (same nesting
+    logic used for 'My Games' and publisher folders).
+
+    Numeric folder names (common in Goldberg/CODEX/FLT) are treated as Steam
+    AppIDs and resolved to real game names where possible via local Steam
+    appmanifest files.
+
+    Uses environment variables internally (APPDATA, LOCALAPPDATA, PUBLIC) —
+    returns an empty list on non-Windows platforms.
+    """
+    results = []
+
+    steam_root = _find_steam_root()
+    app_names_cache = None
+    if steam_root:
+        app_names_cache = _read_steam_app_names(steam_root)
+
+    for env_var, rel_path, group_label, include_hidden in _PIRACY_SAVE_LOCATIONS:
+        base = _resolve_env_path(env_var, rel_path)
+        if not base or not os.path.isdir(base):
+            continue
+
+        subdirs_fn = _list_subdirs_hidden if include_hidden else _list_subdirs
+        game_subs = subdirs_fn(base)
+
+        for game_folder in game_subs:
+            folder_name = os.path.basename(game_folder)
+
+            # Skip non-game folders (settings, config, etc.)
+            if folder_name.lower() in _NON_GAME_SUBFOLDERS:
+                continue
+
+            # Skip known non-game numeric AppIDs (Steam internal components)
+            if folder_name.isdigit() and folder_name in _NON_GAME_APPIDS:
+                continue
+
+            resolved = _resolve_game_folders(game_folder, max_depth=3)
+            for save_path in resolved:
+                if _has_any_files(save_path) and not _is_empty_playtime_only(
+                    save_path
+                ):
+                    # If folder is a numeric AppID, try to resolve the real
+                    # game name from local Steam appmanifests.
+                    game_name = _resolve_appid_name(
+                        folder_name, app_names_cache
+                    ) or folder_name
+                    results.append(ScanCandidate(
+                        name=game_name,
+                        save_path=save_path,
+                        source=f"{group_label} (piracy)",
+                        confidence="high",
+                    ))
+    return results
+
+
+def scan_tenoke_and_universe(
+    search_roots: Optional[List[str]] = None,
+) -> List[ScanCandidate]:
+    """TENOKE and UniverseLAN store save folders with a 'TENOKE' or
+    'UniverseLANData' marker directory that can appear under any game
+    installation directory. We search common game library roots for these
+    markers and extract the parent game folder.
+    """
+    results = []
+    if not sys.platform.startswith("win"):
+        return results
+
+    if search_roots is None:
+        # Common game installation locations on Windows
+        search_roots = []
+        for letter in "DEFGHI":
+            search_roots.append(f"{letter}:\\Games")
+            search_roots.append(f"{letter}:\\GOG Games")
+        search_roots.append("C:\\Games")
+
+    marker_dirs = {"TENOKE", "UniverseLANData", "UniverseLAN"}
+    seen_paths = set()
+
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, _ in os.walk(root):
+            # Only check 2 levels deep to keep this fast
+            depth = dirpath[len(root):].count(os.sep)
+            if depth > 2:
+                dirnames[:] = []
+                continue
+
+            for d in dirnames:
+                if d in marker_dirs:
+                    game_path = os.path.join(dirpath, d)
+                    if game_path in seen_paths:
+                        continue
+                    seen_paths.add(game_path)
+                    if _has_any_files(game_path):
+                        game_name = os.path.basename(os.path.dirname(game_path)) or os.path.basename(dirpath)
+                        group = "TENOKE" if "TENOKE" in d else "UniverseLAN"
+                        results.append(ScanCandidate(
+                            name=game_name,
+                            save_path=game_path,
+                            source=f"{group} (piracy)",
+                            confidence="high",
+                        ))
+
+    return results
+
+
+def _is_empty_playtime_only(path: str) -> bool:
+    """True if `path` contains only `playtime.txt` files (Goldberg
+    Steam Emulator tracking files). These are tiny (usually 4 bytes)
+    and not actual save data — the real saves are stored elsewhere.
+    If this is the only content in a folder, skip it as a candidate."""
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.is_file(follow_symlinks=False):
+                    if entry.name.lower() == "playtime.txt":
+                        continue
+                    return False  # found a non-playtime file
+                elif entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                    # Recurse into subfolders — if any non-playtime file exists
+                    # anywhere, this isn't playtime-only.
+                    if not _is_empty_playtime_only(entry.path):
+                        return False
+            return True  # only playtime.txt files found (or empty)
+    except OSError:
+        return False
 
 
 def _has_any_files(path: str, max_check: int = 1) -> bool:
@@ -236,28 +517,79 @@ def _has_direct_files(path: str) -> bool:
     return False
 
 
+def _looks_like_save_folder(name: str) -> bool:
+    """Heuristic: returns True if a folder name suggests it holds save data."""
+    lower = name.lower()
+    save_keywords = {"save", "saves", "savegame", "savegames", "saved games",
+                     "savedata", "save_data", "save data", "gamesave", "gamesaves",
+                     "player", "players", "userdata", "user-data",
+                     "profil", "savefiles", "save game", "gamedata",
+                     "saved", "autosave", "autosaves", "quick saves"}
+    non_save_keywords = {"config", "configs", "logs", "log", "screenshots",
+                         "shader", "shaders", "texturecache", "cache", "metadata",
+                         "temp", "tmp", "backup", "backups", "benchmark",
+                         "benchmarkresults", "editordata", "exportedteams",
+                         "languages", "skins", "tactics", "profiles",
+                         "crashdumps", "crashdump", "settings"}
+    if lower in non_save_keywords or any(nk in lower for nk in non_save_keywords):
+        return False
+    return any(kw in lower for kw in save_keywords)
+
+
 def _resolve_game_folders(path: str, max_depth: int = 2, _depth: int = 1) -> List[str]:
     """Given one direct child of a 'My Games'/'Saved Games'-style root,
     returns the path(s) that actually represent a game's save folder.
 
     Usually that's just `path` itself. But some publishers nest an extra
     level (My Games\\<Publisher>\\<Game>\\) — detected here by the folder
-    having no files of its own, only subfolders, which means treating its
-    OWN name as "the game" would show the publisher's name instead of the
-    actual game (this was a real, reported bug: games were showing up
-    labeled by their studio). When that's detected, each inner folder is
-    resolved instead — correctly recovering the real per-game names, and
-    handling a publisher folder that groups more than one of their games
-    the same way (each becomes its own candidate)."""
+    being a known publisher name, which means treating its OWN name as "the
+    game" would show the publisher's name instead of the actual game (this
+    was a real, reported bug: games were showing up labeled by their studio).
+    When that's detected, each inner folder is resolved instead — correctly
+    recovering the real per-game names, and handling a publisher folder that
+    groups more than one of their games the same way (each becomes its own
+    candidate).
+
+    When descending into subfolders, prefers save-related folders (e.g.
+    'SaveGames') over generic ones (e.g. 'Config', 'Logs') to avoid
+    duplicate candidates for the same game."""
+    folder_name = os.path.basename(path).lower()
+    if folder_name in _PUBLISHER_SAVE_FOLDERS:
+        # Publisher/studio folder — always descend, never return the
+        # publisher folder itself as a candidate.
+        subs = _list_subdirs(path)
+        resolved = []
+        for sub in subs:
+            if os.path.basename(sub).lower() in _NON_GAME_SUBFOLDERS:
+                continue
+            resolved.extend(_resolve_game_folders(sub, max_depth, _depth + 1))
+        return resolved
     if _has_direct_files(path) or _depth > max_depth:
         return [path]
     subs = _list_subdirs(path)
     if not subs:
         return []  # genuinely empty — nothing to report
-    resolved = []
-    for sub in subs:
-        resolved.extend(_resolve_game_folders(sub, max_depth, _depth + 1))
-    return resolved
+
+    # If any subfolder looks like a save folder, prefer those over others
+    save_subs = [s for s in subs if _looks_like_save_folder(os.path.basename(s))]
+    if save_subs:
+        # Recurse into save-related subfolders only
+        resolved = []
+        for sub in save_subs:
+            resolved.extend(_resolve_game_folders(sub, max_depth, _depth + 1))
+        return resolved
+    else:
+        # No subfolder looks like a save folder — check if the path itself
+        # has files (it might be a game with saves directly) or has subdirs
+        # that contain saves deeper. If the path has any files anywhere,
+        # return it as the candidate.
+        if _has_any_files(path):
+            return [path]
+        # Fallback: recurse into all subdirs but only return paths that have files
+        resolved = []
+        for sub in subs:
+            resolved.extend(_resolve_game_folders(sub, max_depth, _depth + 1))
+        return resolved
 
 
 def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
@@ -268,9 +600,16 @@ def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
     candidate is always named after the actual game, not its publisher."""
     results = []
     for sub in _list_subdirs(root):
+        if os.path.basename(sub).lower() in _NON_GAME_FLAT_FOLDERS:
+            continue
+        sub_name = os.path.basename(sub)
+        is_publisher = sub_name.lower() in _PUBLISHER_SAVE_FOLDERS
         for resolved_path in _resolve_game_folders(sub):
+            # For publisher folders, the resolved path goes deeper into a
+            # game subfolder — use that folder's name, not the publisher's.
+            name = os.path.basename(resolved_path) if is_publisher else sub_name
             results.append(ScanCandidate(
-                name=os.path.basename(resolved_path), save_path=resolved_path,
+                name=name, save_path=resolved_path,
                 source=source_label, confidence="high",
             ))
     return results
@@ -303,11 +642,15 @@ def scan_publisher_style(documents_root: str) -> List[ScanCandidate]:
         # Publisher -> Game -> Saves -> *.sav
         game_subs = _list_subdirs(sub)
         for game_folder in game_subs:
+            # Use the game folder name (e.g. "OnimushaWotS") as the candidate
+            # name, not the resolved save path which might be "backup" or
+            # "SaveGames" etc.
+            game_name = os.path.basename(game_folder)
             resolved = _resolve_game_folders(game_folder, max_depth=3)
             for save_path in resolved:
                 if _has_any_files(save_path):
                     results.append(ScanCandidate(
-                        name=os.path.basename(save_path) or os.path.basename(game_folder),
+                        name=game_name,
                         save_path=save_path,
                         source=os.path.basename(sub).title(),
                         confidence="high",
@@ -585,6 +928,12 @@ def discover_candidates(
 
     if os.path.isdir(appdata_local):
         candidates += scan_appdata_style(appdata_local)
+
+    # Scan piracy/emulator save directories (Goldberg, CODEX, SkidRow, etc.)
+    # Only on Windows — these paths use Windows environment variables.
+    if sys.platform.startswith("win"):
+        candidates += scan_piracy_saves()
+        candidates += scan_tenoke_and_universe()
 
     if os.path.isdir(xdg_data_home):
         candidates += scan_xdg_style(xdg_data_home, _XDG_DATA_EXCLUDE, "Local Data")

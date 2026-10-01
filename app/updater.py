@@ -10,8 +10,6 @@ No server is required — GitHub Hosts the release tags and binaries.
 """
 
 import json
-import os
-import tempfile
 import time
 import urllib.error
 import urllib.request
