@@ -18,6 +18,7 @@ import os
 import re
 import zipfile
 from datetime import datetime
+from typing import List
 
 from PySide6.QtCore import QThread, Signal
 
@@ -130,6 +131,109 @@ def _is_forbidden_save_path(path: str) -> bool:
     return False
 
 
+def _arcname_key(name: str) -> str:
+    """Comparison key for an archive entry name, matching how zipfile stores it.
+
+    ZipFile.write doesn't store the arcname it's given: it normalizes the
+    path and, where the platform separator isn't "/", replaces os.sep with
+    "/" so the archive stays portable. namelist() therefore returns forward
+    slashes even on Windows, while the name recorded on the way in is
+    whatever os.path.relpath produced -- backslashes on Windows. Comparing
+    those two directly made every nested save folder report all of its files
+    as missing AND unexpected at the same time (reported on Cyberpunk 2077
+    as "603 file(s) missing ... 603 unexpected entry/entries").
+
+    Replaces os.sep rather than a literal backslash so a POSIX save file
+    with a backslash in its name survives intact: there os.sep is already
+    "/", making this a no-op, which is exactly right because zipfile does
+    no substitution on POSIX either.
+    """
+    return name.replace(os.sep, "/")
+
+
+def _verify_backup_archive(zip_path: str, expected_entries: List[str], game_name: str) -> None:
+    """Raise OSError if the just-written archive isn't a trustworthy backup.
+    Returns normally when the archive looks good.
+
+    Without this, a backup that silently failed to write everything still
+    gets a success signal, a recorded timestamp, and an "Up to date" badge
+    -- and change detection would then skip that game until its saves
+    changed again, so the user wouldn't find out the archive was unusable
+    until they went to restore it. The case worth catching is a write that
+    *looks* successful: a drive filling up, removable media acknowledging
+    writes it didn't keep, a failing sector corrupting data after the OS
+    reported it stored. Those are invisible from the write side.
+
+    Three checks, cheapest first, because they aren't equally informative:
+
+      1. the file exists and is non-empty -- catches a create that produced
+         nothing at all
+      2. it opens and its central directory parses -- catches truncation,
+         which is what an interrupted write leaves behind
+      3. every member's CRC-32 is recomputed from the stored bytes
+
+    Check 3 is the one that actually matters, and the only one with real
+    cost: it decompresses the whole archive a second time. That's a modest
+    fraction of the compression the backup already spent, on a background
+    thread that's doing nothing else, which is a fair price for a tool
+    whose entire job is that the copy came out good. Checks 1 and 2 alone
+    are NOT a substitute -- measured on a deliberately bit-flipped
+    archive, they all passed: the size was right, the archive opened, and
+    the entry names and count were perfect, while the stored bytes were
+    garbage.
+
+    The entry list is compared as well, because all three checks above can
+    pass on an archive that is internally valid but incomplete -- a save
+    file that disappeared between the walk and the write, say. A quietly
+    incomplete backup is exactly as useless as a corrupt one.
+
+    Raises OSError, which run()'s existing handler turns into a deleted
+    suspect archive plus a message to the user. That's the right outcome:
+    the save folder itself is never touched, so the backup can simply be
+    retried.
+    """
+    if not os.path.isfile(zip_path):
+        raise OSError(f"{game_name}: the backup file was never created.")
+
+    try:
+        size = os.path.getsize(zip_path)
+    except OSError as exc:
+        raise OSError(f"{game_name}: couldn't read the backup back to verify it ({exc}).") from exc
+    if size <= 0:
+        raise OSError(
+            f"{game_name}: the backup file came out empty (0 bytes) — "
+            f"the backup drive may be full."
+        )
+
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            corrupted = zf.testzip()
+            if corrupted is not None:
+                raise OSError(
+                    f"{game_name}: the backup file is corrupt — the data in "
+                    f"'{corrupted}' doesn't match its checksum."
+                )
+            written = {_arcname_key(name) for name in zf.namelist()}
+    except zipfile.BadZipFile as exc:
+        raise OSError(
+            f"{game_name}: the backup file couldn't be read back ({exc}). "
+            f"The write may have been cut short — check free space on the "
+            f"backup drive."
+        ) from exc
+
+    expected = {_arcname_key(name) for name in expected_entries}
+    if written != expected:
+        missing = sorted(expected - written)
+        unexpected = sorted(written - expected)
+        parts = []
+        if missing:
+            parts.append(f"{len(missing)} file(s) missing (e.g. '{missing[0]}')")
+        if unexpected:
+            count = len(unexpected)
+            parts.append(f"{count} unexpected entr{'y' if count == 1 else 'ies'}")
+        raise OSError(f"{game_name}: the backup file is incomplete — {'; '.join(parts)}.")
+
+
 class BackupWorker(QThread):
     progress = Signal(str, int, int)             # game_id, current, total
     backup_finished = Signal(str, dict, str, str, int)  # game_id, new_snapshot, backup_time_str, zip_path, backups_remaining
@@ -240,6 +344,7 @@ class BackupWorker(QThread):
 
             total = max(len(files), 1)
             zip_kwargs = {"compresslevel": compresslevel} if compresslevel is not None else {}
+            arcnames: List[str] = []
             with zipfile.ZipFile(
                 zip_path, "w",
                 compression=compression,
@@ -247,8 +352,19 @@ class BackupWorker(QThread):
             ) as zf:
                 for i, src in enumerate(files, start=1):
                     rel = os.path.relpath(src, self.save_path)
+                    arcnames.append(rel)
                     zf.write(src, arcname=rel)
                     self.progress.emit(self.game_id, i, total)
+
+            # Before pruning, deliberately. Retention is about deleting the
+            # OLDEST good archives, so deleting any of them on the strength
+            # of a new archive that hasn't been proven good would trade a
+            # recoverable failure (retry the backup; the save folder is
+            # untouched) for an unrecoverable one. Callers rely on nothing
+            # being pruned and no success signal being emitted unless the
+            # archive verifies, so a bad backup leaves the previous ones
+            # exactly as they were.
+            _verify_backup_archive(zip_path, arcnames, self.game_name)
 
             backups_remaining = self._prune_old_backups()
 
