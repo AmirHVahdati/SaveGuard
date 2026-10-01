@@ -64,6 +64,8 @@ from typing import List, Optional, Set
 
 from PySide6.QtCore import QThread, Signal
 
+from app.utils import mark_visited
+
 
 @dataclass
 class ScanCandidate:
@@ -452,11 +454,23 @@ def scan_tenoke_and_universe(
     return results
 
 
-def _is_empty_playtime_only(path: str) -> bool:
+def _is_empty_playtime_only(path: str, _visited: Optional[Set[tuple]] = None) -> bool:
     """True if `path` contains only `playtime.txt` files (Goldberg
     Steam Emulator tracking files). These are tiny (usually 4 bytes)
     and not actual save data — the real saves are stored elsewhere.
-    If this is the only content in a folder, skip it as a candidate."""
+    If this is the only content in a folder, skip it as a candidate.
+
+    `_visited` guards the recursion against a directory cycle. Unlike the
+    other recursions in this module, which are all bounded by an explicit
+    max_depth, this one followed the tree until it found any non-playtime
+    file — so a Windows junction pointing at its own ancestor (which
+    is_dir(follow_symlinks=False) reports as an ordinary directory, and
+    os.path.islink reports as False) sent it into unbounded recursion and
+    a RecursionError instead of a scan result."""
+    if _visited is None:
+        _visited = set()
+    if not mark_visited(_visited, path):
+        return False  # already inspected -- a cycle, and not a fresh subtree
     try:
         with os.scandir(path) as it:
             for entry in it:
@@ -467,7 +481,7 @@ def _is_empty_playtime_only(path: str) -> bool:
                 elif entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
                     # Recurse into subfolders — if any non-playtime file exists
                     # anywhere, this isn't playtime-only.
-                    if not _is_empty_playtime_only(entry.path):
+                    if not _is_empty_playtime_only(entry.path, _visited):
                         return False
             return True  # only playtime.txt files found (or empty)
     except OSError:

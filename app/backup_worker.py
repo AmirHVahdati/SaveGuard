@@ -22,7 +22,7 @@ from datetime import datetime
 from PySide6.QtCore import QThread, Signal
 
 from app.scanner import build_snapshot
-from app.utils import clamp_compression_level, clamp_max_backups
+from app.utils import clamp_compression_level, clamp_max_backups, mark_visited
 
 # Default if no compression_level setting is passed in: zlib's own default
 # level — negligible speed difference from level 1 on typical save-folder
@@ -180,11 +180,31 @@ class BackupWorker(QThread):
             backup_root_abs = os.path.normcase(os.path.normpath(os.path.abspath(self.backup_root)))
 
             files = []
+            # Cycle guard, applied by pruning dirnames in place so os.walk
+            # never descends into a directory it has already seen. This is
+            # needed because os.walk's own followlinks=False (the default
+            # here) does NOT catch a Windows junction: islink() is False
+            # for one, so a junction pointing back at its own ancestor
+            # makes the walk recurse forever -- see mark_visited.
+            visited_dirs: set = set()
+            mark_visited(visited_dirs, self.save_path)
             for dirpath, dirnames, filenames in os.walk(self.save_path):
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not d.startswith(".")
+                    and mark_visited(visited_dirs, os.path.join(dirpath, d))
+                ]
                 in_backup_root = os.path.normcase(os.path.normpath(os.path.abspath(dirpath))) == backup_root_abs
                 for fname in filenames:
                     if fname.startswith("."):
+                        continue
+                    # Skip symlinked files so the archive can't pick up the
+                    # contents of a file outside the save folder. Keeps the
+                    # archive in step with build_snapshot, which already
+                    # ignores these (is_file(follow_symlinks=False) is False
+                    # for a link), so a symlink's target changing no longer
+                    # alters the backup without ever being detected as a change.
+                    if os.path.islink(os.path.join(dirpath, fname)):
                         continue
                     if in_backup_root and _BACKUP_FILENAME_PATTERN.match(fname):
                         continue  # one of our own previous backups, not save data

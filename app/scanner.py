@@ -12,7 +12,9 @@ DirEntry.stat() is effectively free (already returned by FindFirstFile).
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
+
+from app.utils import mark_visited
 
 Snapshot = Dict[str, List[float]]
 
@@ -23,9 +25,16 @@ def build_snapshot(root_path: str) -> Snapshot:
     if not root_path or not os.path.isdir(root_path):
         return snapshot
 
+    # Guards against a directory cycle (most realistically a Windows
+    # junction pointing at its own ancestor, which looks like a plain
+    # directory to is_dir(follow_symlinks=False) and would otherwise walk
+    # forever) -- see mark_visited for why identity, not the link check.
+    visited: Set[tuple] = set()
     stack = [root_path]
     while stack:
         current_dir = stack.pop()
+        if not mark_visited(visited, current_dir):
+            continue
         try:
             entries = os.scandir(current_dir)
         except OSError:
