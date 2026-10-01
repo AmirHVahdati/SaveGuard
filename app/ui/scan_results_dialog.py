@@ -3,17 +3,49 @@ scanner is ever added automatically — the user reviews and picks which
 candidates to start tracking, since folder-name heuristics (especially for
 Documents and AppData) will occasionally guess wrong."""
 
-from PySide6.QtCore import Qt
+import os
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QWidget, QCheckBox, QFrame, QMessageBox
+    QScrollArea, QWidget, QCheckBox, QFrame, QMessageBox, QLineEdit
 )
+
+
+class _EditableCandidate:
+    """Wraps a ScanCandidate with an editable name field. Used so the user
+    can correct a wrong game name before adding."""
+
+    def __init__(self, candidate):
+        self.candidate = candidate
+        self.name_override = None  # if set, overrides candidate.name
+
+    @property
+    def name(self):
+        return self.name_override or self.candidate.name
+
+    @name.setter
+    def name(self, value):
+        self.name_override = value
+
+    @property
+    def save_path(self):
+        return self.candidate.save_path
+
+    @property
+    def source(self):
+        return self.candidate.source
+
+    @property
+    def confidence(self):
+        return self.candidate.confidence
 
 
 class ScanResultsDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
-        self.candidates = candidates
+        self.candidates = [_EditableCandidate(c) for c in candidates]
         self.checkboxes = []  # list of (QCheckBox, candidate)
 
         self.setWindowTitle("Games Found")
@@ -122,12 +154,31 @@ class ScanResultsDialog(QDialog):
 
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
-        name_label = QLabel(candidate.name)
-        name_label.setStyleSheet("font-weight: 600; font-size: 13px;")
+        name_label = QLabel("Game name")
+        name_label.setStyleSheet("color: #8b90a3; font-size: 10px;")
+        text_col.addWidget(name_label)
+
+        name_edit = QLineEdit()
+        name_edit.setText(candidate.name)
+        name_edit.setStyleSheet("""
+            QLineEdit {
+                background-color: #0d111d;
+                border: 1px solid #262b3a;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 13px;
+                color: #e0e0e0;
+            }
+            QLineEdit:focus {
+                border-color: #5cc9ff;
+            }
+        """)
+        name_edit.textChanged.connect(lambda text, ec=candidate: setattr(ec, 'name', text))
+        text_col.addWidget(name_edit)
+
         path_label = QLabel(candidate.save_path)
         path_label.setStyleSheet("color: #8b90a3; font-size: 11px;")
         path_label.setWordWrap(True)
-        text_col.addWidget(name_label)
         text_col.addWidget(path_label)
         layout.addLayout(text_col, 1)
 
@@ -138,6 +189,25 @@ class ScanResultsDialog(QDialog):
             f"background-color: #22{badge_color[1:]}; border-radius: 8px; padding: 3px 8px;"
         )
         layout.addWidget(source_badge, 0, Qt.AlignTop)
+        layout.addSpacing(6)
+
+        open_btn = QPushButton()
+        open_btn.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_DirOpenIcon))
+        open_btn.setToolTip("Open save folder in Explorer")
+        open_btn.setFixedSize(24, 24)
+        open_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0d111d;
+                border: 1px solid #262b3a;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #222a3a;
+                border-color: #5cc9ff;
+            }
+        """)
+        open_btn.clicked.connect(lambda checked, path=candidate.save_path: self._open_in_explorer(path))
+        layout.addWidget(open_btn)
 
         self.checkboxes.append((checkbox, candidate))
         return row
@@ -152,8 +222,31 @@ class ScanResultsDialog(QDialog):
         self.add_btn.setText(f"Add {count} Game{'s' if count != 1 else ''}" if count else "Add Selected")
 
     def _on_add_clicked(self):
-        self.selected_candidates = [c for cb, c in self.checkboxes if cb.isChecked()]
+        self.selected_candidates = [
+            self._to_scan_candidate(c)
+            for cb, c in self.checkboxes
+            if cb.isChecked()
+        ]
         self.accept()
+
+    @staticmethod
+    def _to_scan_candidate(ec):
+        """Convert an _EditableCandidate back to a ScanCandidate with
+        the user's name edit applied."""
+        from app.game_scanner import ScanCandidate
+        return ScanCandidate(
+            name=ec.name,
+            save_path=ec.save_path,
+            source=ec.source,
+            confidence=ec.confidence,
+        )
+
+    def _open_in_explorer(self, path: str):
+        """Open the given folder in the system file explorer."""
+        if os.path.isdir(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        else:
+            QMessageBox.warning(self, "Path not found", f"The folder doesn't exist:\n{path}")
 
     def _on_copy_results(self):
         """Copy all scan results to clipboard as text that can be pasted
