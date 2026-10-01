@@ -76,6 +76,7 @@ class ScanResultsDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         self.add_btn = QPushButton()
         self.add_btn.setObjectName("PrimaryButton")
+        self.add_btn.setMinimumWidth(110)
         self.add_btn.clicked.connect(self._on_add_clicked)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(self.add_btn)
@@ -94,8 +95,30 @@ class ScanResultsDialog(QDialog):
 
         checkbox = QCheckBox()
         checkbox.setChecked(False)  # let user select which games to track
+        checkbox.setFixedSize(22, 22)
+        checkbox.setStyleSheet("""
+            QCheckBox {
+                margin: 0;
+                padding: 0;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1.5px solid #8b90a3;
+                background: transparent;
+            }
+            QCheckBox::indicator:checked {
+                border-color: #5cc9ff;
+                background: #5cc9ff;
+            }
+            QCheckBox::indicator:checked:hover {
+                border-color: #7ad2ff;
+            }
+        """)
         checkbox.stateChanged.connect(self._update_add_button_text)
         layout.addWidget(checkbox)
+        layout.addSpacing(4)
 
         text_col = QVBoxLayout()
         text_col.setSpacing(2)

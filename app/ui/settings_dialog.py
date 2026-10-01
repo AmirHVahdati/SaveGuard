@@ -146,7 +146,7 @@ class SettingsDialog(QDialog):
         divider2.setStyleSheet("background-color: #262b3a; max-height: 1px; border: none; margin: 16px 0;")
         layout.addWidget(divider2)
 
-        location_label = QLabel("Default location for scanned games")
+        location_label = QLabel("Default save location for games")
         location_label.setStyleSheet("font-weight: 600; font-size: 13px;")
         layout.addWidget(location_label)
 
@@ -201,6 +201,8 @@ class SettingsDialog(QDialog):
         version_label.setAlignment(Qt.AlignHCenter)
         version_label.setStyleSheet("color: #8b90a3; font-size: 12px;")
         layout.addWidget(version_label)
+
+        layout.addSpacing(24)
 
         update_row = QHBoxLayout()
         update_row.addStretch()
