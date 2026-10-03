@@ -12,7 +12,7 @@ class Game:
     save_path: str          # folder where the game writes its save files
     backup_root: str        # folder the user wants backups copied into
     last_backup_time: Optional[str] = None
-    last_snapshot: Optional[Dict[str, List[float]]] = None  # {relpath: [size, mtime]}
+    last_snapshot: Optional[Dict[str, List[float]]] = None  # {relpath: [size, mtime_ns]}
     backup_count: int = 0
     color: Optional[str] = None  # user-assigned tag color, e.g. "#7c5cff"; None = auto
 
