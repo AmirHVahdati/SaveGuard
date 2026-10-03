@@ -40,6 +40,17 @@ python main.py
 
 Want a standalone Windows `.exe` and installer instead of running from source? See [BUILDING.md](BUILDING.md).
 
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite runs headless and is safe to run on your real machine: it never opens
+a window, never touches your real `~/.saveguard/` folder, and never makes a
+network request. See [BUILDING.md](BUILDING.md#running-the-tests) for details.
+
 ## How it works
 
 1. Click **"Add Game"**, give it a name, and select:

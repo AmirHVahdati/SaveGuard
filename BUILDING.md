@@ -58,6 +58,46 @@ Two places need the version number bumped together:
 
 Then repeat steps 2 and 3 above.
 
+## Running the tests
+
+The suite is a normal pytest run — nothing to build first:
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+That runs ~850 tests in about 10 seconds and needs no arguments. Useful variations:
+
+```powershell
+python -m pytest tests/test_ui_main_window.py      # one file
+python -m pytest -k "backup_all"                   # by name
+python -m pytest -x                                # stop at the first failure
+python -m pytest --lf                              # re-run what failed last time
+```
+
+### Why it's safe to run
+
+Running the tests must never disturb a real SaveGuard install, so `tests/conftest.py` takes care of that automatically:
+
+- **No windows.** Qt runs on its `offscreen` platform, set at import time in `conftest.py`. Nothing appears on screen. Set `QT_QPA_PLATFORM` yourself before running pytest if you *want* real windows.
+- **No real config.** Every read and write of `~/.saveguard/` — games, settings, state, the update cache, the crash log — is redirected into a throwaway `tmp_path` per test.
+- **No real user folders.** The one function that walks the real user's save locations is stubbed out.
+- **No network.** The update-check tests use fake GitHub responses; nothing reaches the internet.
+- **No hung runs.** Modal dialogs are answered by fixtures rather than clicked, so a test can't leave a message box open waiting for a mouse.
+
+### When a test needs a modal dialog or a background thread
+
+Two recurring patterns, both already used throughout the suite:
+
+- `message_spy` captures `QMessageBox.warning/critical/information/question` calls instead of showing them, so a test can assert that the right dialog appeared.
+- Test doubles replace `BackupWorker` and `GameScanWorker` (`FakeBackupWorker` / `FakeScanWorker` in `tests/test_ui_main_window.py`), which record how they were constructed and never actually run. They subclass `QObject` so their signals still connect properly, and they define `finished` because the window waits on that signal before dropping its reference to a worker.
+
+Two Qt behaviours catch people out when writing new UI tests:
+
+- The window recomputes every game's status as soon as the event loop turns. State set up in a *fixture* can therefore be overwritten before the test body runs — set it up in the test body instead.
+- An unshown offscreen window reports `isVisible() == False` for all of its children, so test visibility with `isHidden()` rather than `isVisible()`.
+
 ## Troubleshooting
 
 **Taskbar icon shows as a solid black square, and/or the icon inside the app itself doesn't show either.** Root cause: PyInstaller 6.0+ changed onedir builds to place all bundled files (including `assets/`) inside a `_internal` subfolder next to the exe, instead of directly beside it. Code that assumes bundled data always sits right next to `sys.executable` — which is exactly what an earlier version of this app did — silently looks in the wrong place once built with a current PyInstaller version, so the icon files simply aren't found. (This is called out explicitly in PyInstaller's own 6.0 changelog: *"Assumptions that `os.path.dirname(sys.executable) == sys._MEIPASS` will break."*)
