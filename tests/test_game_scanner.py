@@ -1101,3 +1101,126 @@ class TestGameScanWorker:
         worker = game_scanner.GameScanWorker(set())
         assert "finished" not in type(worker).__dict__
         assert hasattr(worker.finished, "connect")
+
+
+# ---------------------------------------------------------------------------
+# one unreadable entry must not take its readable siblings with it
+# ---------------------------------------------------------------------------
+
+class _UnclassifiableEntry:
+    """A directory entry that can't be classified as file or directory.
+
+    Reproduces what happens on Linux when the filesystem doesn't report a type
+    in the directory listing (FUSE mounts, some network mounts, XFS without
+    ftype): CPython has to fall back to a real stat() on the entry, and that can
+    fail with EACCES, or on an entry removed while the scan was walking past it.
+    """
+
+    def __init__(self, real_entry):
+        self._real = real_entry
+        self.name = real_entry.name
+        self.path = real_entry.path
+
+    def _refuse(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    is_dir = _refuse
+    is_file = _refuse
+
+
+class _Listing:
+    """Context-manager wrapper, matching what os.scandir hands back."""
+
+    def __init__(self, entries):
+        self._entries = entries
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+@pytest.fixture
+def poison_entry(monkeypatch):
+    """Return a setter that makes one named entry in every listing fail to
+    classify, leaving all the others real and readable."""
+    real_scandir = os.scandir
+
+    def apply(victim):
+        def fake_scandir(path):
+            def listing():
+                with real_scandir(path) as found:
+                    for entry in found:
+                        if entry.name == victim:
+                            yield _UnclassifiableEntry(entry)
+                        else:
+                            yield entry
+            return _Listing(listing())
+        monkeypatch.setattr(game_scanner.os, "scandir", fake_scandir)
+
+    return apply
+
+
+class TestUnclassifiableEntryCostsOnlyItself:
+    def test_list_subdirs_keeps_readable_siblings(self, tmp_path, poison_entry):
+        for name in ("aaa", "bbb"):
+            (tmp_path / name).mkdir()
+        poison_entry("aaa")
+        assert sorted(_list_subdirs(str(tmp_path))) == [str(tmp_path / "bbb")]
+
+    def test_list_subdirs_hidden_keeps_readable_siblings(self, tmp_path, poison_entry):
+        (tmp_path / ".aaa").mkdir()
+        (tmp_path / ".bbb").mkdir()
+        poison_entry(".aaa")
+        assert _list_subdirs_hidden(str(tmp_path)) == [str(tmp_path / ".bbb")]
+
+    def test_has_any_files_still_sees_a_file_next_to_a_bad_entry(
+            self, tmp_path, poison_entry):
+        # "aaa" sorts first, so the old code hit the failure before the file
+        # and reported the whole folder as empty -- dropping a real save.
+        (tmp_path / "aaa").mkdir()
+        (tmp_path / "slot.sav").write_text("x", encoding="utf-8")
+        poison_entry("aaa")
+        assert _has_any_files(str(tmp_path)) is True
+
+    def test_has_direct_files_still_sees_a_file_next_to_a_bad_entry(
+            self, tmp_path, poison_entry):
+        (tmp_path / "aaa").mkdir()
+        (tmp_path / "slot.sav").write_text("x", encoding="utf-8")
+        poison_entry("aaa")
+        assert _has_direct_files(str(tmp_path)) is True
+
+    def test_read_steam_app_names_keeps_readable_manifests(self, tmp_path, poison_entry):
+        steam = make_steam_install(
+            tmp_path / "Steam",
+            apps={"220": "Half-Life 2", "570": "Dota 2"},
+        )
+        poison_entry("appmanifest_220.acf")
+        assert _read_steam_app_names(str(steam)) == {"570": "Dota 2"}
+
+    def test_one_bad_manifest_does_not_empty_a_whole_steam_scan(
+            self, tmp_path, poison_entry):
+        # The user-visible version of the bug: names that can't be read are
+        # dropped rather than reported as bare AppIDs, so a single unreadable
+        # entry used to take every game in the account with it.
+        steam = make_steam_install(
+            tmp_path / "Steam",
+            apps={"220": "Half-Life 2", "570": "Dota 2"},
+            userdata={
+                "111": {"220": {"remote": {"a": "x"}}},
+                "222": {"570": {"remote": {"b": "x"}}},
+            },
+        )
+        poison_entry("appmanifest_220.acf")
+        assert names_of(scan_steam_userdata(str(steam))) == ["Dota 2"]
+
+    def test_unreadable_root_still_yields_an_empty_listing(self, tmp_path):
+        # The originally reported case: a directory we can't open at all. This
+        # was already handled (PermissionError subclasses OSError) and must
+        # keep working.
+        assert _list_subdirs(str(tmp_path / "does-not-exist")) == []
+        assert _list_subdirs_hidden(str(tmp_path / "does-not-exist")) == []

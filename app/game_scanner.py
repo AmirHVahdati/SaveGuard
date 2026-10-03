@@ -213,14 +213,45 @@ _SAVE_FOLDER_KEYWORDS = {
 }
 
 
-def _list_subdirs(path: str) -> List[str]:
+def _entry_is_dir(entry, follow_symlinks: bool = False) -> bool:
+    """True if the directory entry is a directory, False if it can't be told.
+
+    An entry is not always classifiable for free: on a filesystem that doesn't
+    report a type in the directory listing (FUSE mounts, some network mounts,
+    XFS without ftype) Python has to fall back to a real stat() on the entry,
+    which can fail on permissions or on an entry that was removed while the
+    scan was walking past it. Returning False rather than raising keeps that
+    failure scoped to the one entry -- an exception escaping here takes every
+    readable sibling in the same directory with it, and the games in them then
+    just silently never show up in the scan results.
+    """
     try:
-        return [
-            entry.path for entry in os.scandir(path)
-            if entry.is_dir(follow_symlinks=False) and not entry.name.startswith(".")
-        ]
+        return entry.is_dir(follow_symlinks=follow_symlinks)
     except OSError:
-        return []
+        return False
+
+
+def _entry_is_file(entry, follow_symlinks: bool = False) -> bool:
+    """True if the directory entry is a regular file. See _entry_is_dir for
+    why an unclassifiable entry reports False instead of raising."""
+    try:
+        return entry.is_file(follow_symlinks=follow_symlinks)
+    except OSError:
+        return False
+
+
+def _list_subdirs(path: str) -> List[str]:
+    found = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if _entry_is_dir(entry) and not entry.name.startswith("."):
+                    found.append(entry.path)
+    except OSError:
+        # The directory itself is unreadable. Anything gathered before the
+        # failure is still worth returning -- a partial listing beats none.
+        pass
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +266,15 @@ def _list_subdirs(path: str) -> List[str]:
 def _list_subdirs_hidden(path: str) -> List[str]:
     """Like _list_subdirs but includes hidden directories (names starting with .).
     Needed for folders like %APPDATA%/.1911 (Razor1911 saves)."""
+    found = []
     try:
-        return [
-            entry.path for entry in os.scandir(path)
-            if entry.is_dir(follow_symlinks=False)
-        ]
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if _entry_is_dir(entry):
+                    found.append(entry.path)
     except OSError:
-        return []
+        pass  # partial listing beats none -- see _list_subdirs
+    return found
 
 
 # Known piracy/emulator save locations that follow a simple structure:
@@ -503,11 +536,11 @@ def _has_any_files(path: str, max_check: int = 1) -> bool:
         try:
             with os.scandir(current) as it:
                 for entry in it:
-                    if entry.is_file(follow_symlinks=False) and not entry.name.startswith("."):
+                    if _entry_is_file(entry) and not entry.name.startswith("."):
                         found += 1
                         if found >= max_check:
                             return True
-                    elif entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                    elif _entry_is_dir(entry) and not entry.name.startswith("."):
                         stack.append(entry.path)
         except OSError:
             continue
@@ -524,7 +557,7 @@ def _has_direct_files(path: str) -> bool:
     try:
         with os.scandir(path) as it:
             for entry in it:
-                if entry.is_file(follow_symlinks=False) and not entry.name.startswith("."):
+                if _entry_is_file(entry) and not entry.name.startswith("."):
                     return True
     except OSError:
         pass
@@ -755,7 +788,11 @@ def _read_steam_app_names(steam_root: str) -> dict:
         return names
     with entries:
         for entry in entries:
-            if not (entry.is_file() and entry.name.startswith("appmanifest_") and entry.name.endswith(".acf")):
+            # follow_symlinks=True to match the plain is_file() call this
+            # replaced: an appmanifest symlinked into place is still valid.
+            if not (_entry_is_file(entry, follow_symlinks=True)
+                    and entry.name.startswith("appmanifest_")
+                    and entry.name.endswith(".acf")):
                 continue
             appid = entry.name[len("appmanifest_"):-len(".acf")]
             try:
