@@ -41,6 +41,15 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = dict(settings)  # work on a copy until Save is clicked
         self.result_settings = None
+        # Captured before anything can edit the copy, so _on_save can tell a
+        # path the user typed from one the dialog was merely opened with. The
+        # field is pre-filled from this setting, and the folder behind it can
+        # stop existing on its own -- deleted, an external drive unplugged, a
+        # home directory that moved -- so the distinction decides whether a
+        # path the user never entered is allowed to block saving.
+        self._opened_with_backup_root = str(
+            settings.get("default_scan_backup_root") or ""
+        ).strip()
 
         self.setWindowTitle("Settings")
         self.setModal(True)
@@ -258,21 +267,58 @@ class SettingsDialog(QDialog):
         self.value_label.setText(str(value))
         self.description_label.setText(_LEVEL_DESCRIPTIONS.get(value, ""))
 
+    def _offer_to_create_backup_root(self, path: str) -> bool:
+        """Ask about a missing backup folder. True if it exists afterwards.
+
+        Offered rather than done silently because the app creates this folder
+        regardless: BackupWorker.run() calls os.makedirs on the backup root, and
+        _add_scanned_games only joins paths onto it. So the folder not existing
+        is never itself a failure -- the real question is whether to create it
+        now, before any game is pointed at it, or leave it to the first backup.
+
+        Defaulted to No, and worded so a mistyped path is visibly a mistake: a
+        stray folder at a typo is harder to notice than a refused save.
+        """
+        reply = QMessageBox.question(
+            self,
+            "Folder doesn't exist",
+            f"There's nothing at:\n{path}\n\n"
+            f"SaveGuard can create that folder now, or you can point it at an "
+            f"existing one instead. If you meant somewhere else, cancel and "
+            f"check the path -- clearing the field keeps your current setting.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return False
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Couldn't create folder",
+                f"SaveGuard couldn't create that folder:\n{path}\n\n{exc}\n\n"
+                f"Check that the path is right and that you have permission to "
+                f"write there.",
+            )
+            return False
+        return True
+
     def _on_save(self):
         self.settings["compression_level"] = self.slider.value()
         self.settings["max_backups"] = self.max_backups_spin.value()
 
         path = self.scan_backup_root_edit.text().strip()
-        if path:
-            if not os.path.isdir(path):
-                QMessageBox.warning(
-                    self,
-                    "Invalid path",
-                    f"The folder you entered doesn't exist:\n{path}\n\n"
-                    "Please choose an existing folder, or clear the field to use "
-                    "the default location.",
-                )
+        # Only a path the user typed or changed is validated, and an unchanged
+        # one is taken as-is. Re-checking the value the dialog was opened with
+        # would let a folder that stopped existing on its own block every other
+        # setting here -- changing the compression level would fail with a
+        # complaint about a path the user never touched and cannot recall
+        # typing. They can still fix it by editing the field.
+        if path and path != self._opened_with_backup_root:
+            if not os.path.isdir(path) and not self._offer_to_create_backup_root(path):
                 return
+        if path:
             self.settings["default_scan_backup_root"] = path
         # if left blank, silently keep whatever was there before rather than
         # writing an empty path — MainWindow always has a sane built-in

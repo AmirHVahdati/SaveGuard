@@ -4,7 +4,7 @@ location."""
 import os
 
 import pytest
-from PySide6.QtWidgets import QDialog, QFileDialog
+from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from app.config import DEFAULT_SETTINGS
 from app.ui.settings_dialog import SettingsDialog
@@ -143,9 +143,139 @@ class TestSave:
         dialog = make_dialog(qtbot)
         dialog.scan_backup_root_edit.setText(str(tmp_path / "not_here"))
         dialog._on_save()
-        assert message_spy.calls[0][2] == "Invalid path"
+        # message_spy stubs question() to None, i.e. declining the offer.
+        assert message_spy.calls[0][0] == "question"
+        assert message_spy.calls[0][2] == "Folder doesn't exist"
         assert dialog.result() != QDialog.Accepted
         assert dialog.result_settings is None
+        # Declining must not leave the folder behind either.
+        assert not (tmp_path / "not_here").exists()
+
+
+class TestCreatingAMissingBackupFolder:
+    """A backup root that doesn't exist is never itself a failure.
+
+    BackupWorker.run() calls os.makedirs on the backup root and
+    _add_scanned_games only joins paths onto it, so the folder gets created on
+    demand regardless. Offering to create it now turns a dead end into one
+    click, and does it before any game is pointed at the path.
+    """
+
+    def missing(self, tmp_path):
+        return str(tmp_path / "not_here")
+
+    def test_accepting_creates_the_folder_and_saves(
+            self, qtbot, tmp_path, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "question",
+                            lambda *a, **k: QMessageBox.Yes)
+        dialog = make_dialog(qtbot)
+        dialog.scan_backup_root_edit.setText(self.missing(tmp_path))
+
+        dialog._on_save()
+
+        assert dialog.result() == QDialog.Accepted
+        assert dialog.result_settings["default_scan_backup_root"] == self.missing(tmp_path)
+        assert (tmp_path / "not_here").is_dir()
+
+    def test_the_offer_defaults_to_declining(self, qtbot, tmp_path, monkeypatch):
+        # A mistyped path should leave no stray folder behind, so the button
+        # that a stray Enter would trigger is the safe one.
+        seen = {}
+
+        def question(*args, **kwargs):
+            seen["default"] = kwargs.get("defaultButton", args[4] if len(args) > 4 else None)
+            return QMessageBox.No
+
+        monkeypatch.setattr(QMessageBox, "question", question)
+        dialog = make_dialog(qtbot)
+        dialog.scan_backup_root_edit.setText(self.missing(tmp_path))
+        dialog._on_save()
+
+        assert seen["default"] == QMessageBox.No
+        assert not (tmp_path / "not_here").exists()
+
+    def test_a_file_in_the_way_is_reported_rather_than_overwritten(
+            self, qtbot, tmp_path, message_spy, monkeypatch):
+        # os.path.isdir is False for a plain file, and makedirs then raises
+        # FileExistsError. The user must be told, not left guessing. message_spy
+        # is required here: the autouse fixture only stubs question(), so
+        # warning() would be a real modal box and hang the run.
+        monkeypatch.setattr(QMessageBox, "question",
+                            lambda *a, **k: QMessageBox.Yes)
+        blocker = tmp_path / "not_here"
+        blocker.write_text("I am a file, not a folder", encoding="utf-8")
+        dialog = make_dialog(qtbot)
+        dialog.scan_backup_root_edit.setText(str(blocker))
+
+        dialog._on_save()
+
+        assert dialog.result() != QDialog.Accepted
+        assert dialog.result_settings is None
+        assert any(call[2] == "Couldn't create folder" for call in message_spy.calls)
+        # The file is left exactly as it was.
+        assert blocker.read_text(encoding="utf-8") == "I am a file, not a folder"
+
+    def test_a_failure_to_create_is_surfaced(self, qtbot, tmp_path,
+                                            message_spy, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "question",
+                            lambda *a, **k: QMessageBox.Yes)
+
+        def refuse(*args, **kwargs):
+            raise OSError(13, "Permission denied")
+
+        monkeypatch.setattr(os, "makedirs", refuse)
+        dialog = make_dialog(qtbot)
+        dialog.scan_backup_root_edit.setText(self.missing(tmp_path))
+
+        dialog._on_save()
+
+        assert dialog.result() != QDialog.Accepted
+        assert any(call[2] == "Couldn't create folder" for call in message_spy.calls)
+
+
+class TestUnchangedStoredPathIsNotRevalidated:
+    """The field is pre-filled from the stored setting, and that folder can stop
+    existing on its own -- deleted, an external drive unplugged, a home
+    directory that moved. Re-checking a value the user never entered would let
+    it block every other setting in the dialog."""
+
+    def gone(self, tmp_path):
+        root = tmp_path / "Backups"
+        root.mkdir()
+        return root
+
+    def test_a_missing_stored_path_does_not_block_saving(
+            self, qtbot, tmp_path, message_spy):
+        root = self.gone(tmp_path)
+        import shutil
+        shutil.rmtree(root)  # the setting now points at a folder that isn't there
+        dialog = make_dialog(qtbot, {"default_scan_backup_root": str(root)})
+        dialog.slider.setValue(1)
+
+        dialog._on_save()
+
+        assert dialog.result() == QDialog.Accepted
+        assert dialog.result_settings["compression_level"] == 1
+        # Nothing was asked, because the user changed no path.
+        assert message_spy.calls == []
+
+    def test_a_path_the_user_types_is_still_validated(
+            self, qtbot, tmp_path, message_spy):
+        dialog = make_dialog(qtbot, {"default_scan_backup_root": str(tmp_path)})
+        dialog.scan_backup_root_edit.setText(str(tmp_path / "typo"))
+
+        dialog._on_save()
+
+        # Otherwise the exemption would quietly accept any mistyped path.
+        assert dialog.result() != QDialog.Accepted
+        assert message_spy.calls[0][2] == "Folder doesn't exist"
+
+    def test_an_existing_stored_path_is_still_accepted(
+            self, qtbot, tmp_path, message_spy):
+        dialog = make_dialog(qtbot, {"default_scan_backup_root": str(tmp_path)})
+        dialog._on_save()
+        assert dialog.result() == QDialog.Accepted
+        assert message_spy.calls == []
 
     def test_emptying_the_field_keeps_the_previous_value(self, qtbot, tmp_path):
         dialog = make_dialog(qtbot, {"default_scan_backup_root": str(tmp_path)})
