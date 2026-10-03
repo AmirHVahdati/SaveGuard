@@ -1,68 +1,202 @@
 # SaveGuard 🛡️
 
-A lightweight desktop utility for PC gamers who don't use Steam Cloud (or any
-launcher) — track any game's save folder and back it up manually, with
-automatic change detection. Works on Windows and Linux (including SteamOS
-and CachyOS).
+**A launcher-free game save backup utility.** Point it at a game's save folder
+and it keeps a restorable, timestamped copy of it, then tells you when the game
+has changed since you last backed up. No Steam Cloud, no launcher, no account.
 
-**Version 1.0** · MIT licensed — see [LICENSE](LICENSE).
+Built for the games that have neither — or for players who simply don't trust a
+background sync to be the only copy of their saves.
+
+| | |
+|---|---|
+| **Version** | 1.0.0 |
+| **License** | [MIT](LICENSE) |
+| **Platforms** | Windows, Linux (including SteamOS and CachyOS) |
+| **Runtime dependencies** | [PySide6](https://doc.qt.io/qtforpython/) only |
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Day-to-day use](#day-to-day-use)
+- [How change detection works](#how-change-detection-works)
+- [Running the tests](#running-the-tests)
+- [Building a Windows installer](#building-a-windows-installer)
+- [Notes](#notes)
+- [License](#license)
+
+---
 
 ## Features
 
-- **Add any game** by pointing to its save folder and a backup destination — works with any game, any launcher, or no launcher at all.
-- **Automatic game discovery** — SaveGuard scans common save locations and suggests games it finds that aren't tracked yet. This runs once automatically the first time you open the app, and any time you click **"Scan Games"**. Scanning always happens on a background thread, so the app never freezes — and nothing is added automatically: you review and pick which results to track from a checklist first. Locations scanned:
-  - **Windows**: `Documents\My Games`, `Saved Games`, `Documents`, `AppData\Local`
-  - **Linux** (including SteamOS, CachyOS, and other Arch/Fedora-based gaming distros): `~/.local/share`, `~/.config`
-  - **Steam**, on any OS: its local `userdata` cloud-save folders, checking native, Flatpak, and Snap install locations, plus **Proton game prefixes** — a Windows game played through Proton gets the same accurate detection as it would on native Windows, since Proton mirrors a real Windows user folder internally
-  - Every Steam/Proton result is only shown when its real name can be resolved from a local Steam file — never as a generic "Steam App `<id>`", and Steam's own internal components (which aren't games) are filtered out
-- **One-click backup** — compresses the save folder into a timestamped `.zip` archive.
-- **Settings** — opens from the "Settings" button in the header:
-  - **Compression level** for future backups (fastest/largest to smallest/slowest). The top "Maximum" setting uses a stronger algorithm (LZMA) than the rest of the scale for noticeably smaller files — see the note below.
-  - **Backups to keep per game** — set to **Unlimited** (the default) to never delete old backups, or to a specific number to automatically keep only that many most recent backups. Once a game has more than that, the oldest ones are deleted right after each new backup finishes, on the same background thread — so this never blocks the UI, even with hundreds of existing backups.
-  - **Default location for scanned games**, and an **About** tab with version info.
-- **Automatic change detection** — every time you open SaveGuard, it rescans each save folder and compares it against the last backup. If anything changed (new save, modified file, etc.), the game is flagged with a **"Changes detected"** badge and an alert banner.
-- **Backup history** — every backup is its own timestamped `.zip` archive, so you never overwrite an old save and can always go back to a previous one.
-- **Modern dark UI** — card-based layout, status badges, a custom color-tag picker to tell games apart at a glance, smooth accents throughout.
-- **No cloud, no accounts** — everything is local. Config lives at `~/.saveguard/` (see **Settings → About** in the app for the exact path).
-- **Support button** — a "♥ Support" link in the header for anyone who wants to support development. *(Note for whoever's maintaining this: the URL is a placeholder in `app/ui/main_window.py` — search for `SUPPORT_URL` and swap in the real donation link once it exists.)*
+### Track any game
 
-## Setup
+Add a game by pointing at the folder it writes saves to and the folder you want
+backups kept in. Nothing about SaveGuard is tied to a store or launcher — if it
+saves to a folder, SaveGuard can back it up.
 
-Requires Python 3.9+ and PySide6. Works on Windows and Linux (including
-SteamOS, CachyOS, and other gaming-focused distros); macOS is untested but
-should work for manual game tracking (automatic Steam/Proton discovery is
-Windows/Linux-focused).
+### Automatic game discovery
+
+SaveGuard scans the places games keep their saves and offers the ones you aren't
+already tracking. This runs once automatically the first time you open the app,
+and any time you click **Scan Games**. It never adds anything on its own: you
+review the results and pick what to keep.
+
+Scanning always happens on a background thread, so the window never freezes.
+
+| Platform | Locations scanned |
+|---|---|
+| **Windows** | `Documents\My Games`, `Saved Games`, `Documents`, `AppData\Local` |
+| **Linux** | `~/.local/share`, `~/.config` |
+| **Steam** (any OS) | Local `userdata` cloud-save folders, across native, Flatpak and Snap installs |
+| **Proton** (any OS) | Windows game prefixes — Proton mirrors a real Windows user folder internally, so a Proton game is detected as accurately as it would be on native Windows |
+
+Steam and Proton results are only shown when the real game name can be resolved
+from a local Steam file, never as a generic `Steam App <id>`, and Steam's own
+internal components are filtered out of the results.
+
+### One-click, restorable backups
+
+Every backup is a separate timestamped `.zip` (`2026-09-11_20-30-00.zip`) written
+into the destination folder you chose. You can use any zip tool to open an old
+one, and nothing you do in SaveGuard overwrites a backup you already have.
+
+### Change detection
+
+Each time the app opens, it re-reads every tracked save folder and compares it
+against the last backup. Anything new, removed or modified flags the game with a
+**Changes detected** badge and raises a banner, so you know a backup is worth
+taking before you close the game.
+
+### Settings
+
+Reachable from the **Settings** button in the header:
+
+- **Compression level** — smaller archives take longer. The top *Maximum* setting
+  uses LZMA instead of DEFLATE; see [Notes](#notes) before using it.
+- **Backups to keep per game** — unlimited by default, or a number. Once a game
+  exceeds it, the oldest archives are pruned on the backup thread, immediately
+  after a new backup is verified.
+- **Default location for scanned games**, plus an **About** tab with version and
+  config path information.
+
+### Modern dark UI
+
+Card-based layout, status badges, and a colour tag per game so a large library
+stays readable.
+
+### Everything local
+
+No cloud, no accounts, no telemetry. All of SaveGuard's data lives in
+`~/.saveguard/` and is written atomically, so an interrupted write can't leave
+it half-written. The exact path is shown in **Settings → About**.
+
+---
+
+## Quick start
+
+Requires Python 3.9 or newer (3.11+ is what the Windows build is tested against)
+and PySide6, which is the only runtime dependency.
 
 ```bash
+git clone <repository-url>
+cd saveguard
+
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
 python main.py
 ```
 
-Want a standalone Windows `.exe` and installer instead of running from source? See [BUILDING.md](BUILDING.md).
+On Windows the activation line is `.venv\Scripts\activate`; on Linux and macOS
+it is `source .venv/bin/activate`.
+
+---
+
+## Day-to-day use
+
+1. Click **Add Game**, name it, and select:
+   - the **save folder** the game writes to — e.g.
+     `%USERPROFILE%\Saved Games\CD Projekt Red\Cyberpunk 2077`
+   - a **backup destination** — e.g. a folder on an external drive
+2. Click **Backup Now** on that game's card to compress the current save state
+   into a new timestamped archive in the destination.
+3. Next time you launch SaveGuard after a play session, it re-checks every
+   tracked folder. If anything changed, the card shows **Changes detected** and a
+   banner offers to back up.
+4. From the card menu, **Open Backups** jumps straight to the backup folder.
+   **Rescan** re-checks for changes on demand, and **Backup All** (header or
+   banner) backs up every game with pending changes in one click.
+
+Backups run on a background thread, one game at a time, so a large library never
+blocks the window.
+
+---
+
+## How change detection works
+
+Each save folder is fingerprinted into a snapshot of every file's size and
+modification time. A game is flagged when the current snapshot differs from the
+one recorded by the last backup.
+
+This is deliberately not a content hash. Hashing was measured at roughly 44× the
+cost of a stat-only walk — 319 ms versus 7 ms on a 52 MB, 603-file save folder —
+and the walk runs once per game on the UI thread at startup. Size plus full
+modification-time precision detects every normal save write while keeping a large
+library's startup under a second.
+
+Consequences worth knowing:
+
+- Restoring an old backup changes the files' timestamps, which correctly reads as
+  a change and prompts a fresh backup.
+- A file whose contents change without its size *and* timestamp changing is not
+  detected. No normal game save does this.
+
+---
 
 ## Running the tests
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 python -m pytest
 ```
 
-The suite runs headless and is safe to run on your real machine: it never opens
-a window, never touches your real `~/.saveguard/` folder, and never makes a
-network request. See [BUILDING.md](BUILDING.md#running-the-tests) for details.
+851 tests, roughly 9 seconds, no arguments needed. The suite runs headless and is
+safe to run on a real machine: it opens no windows, never touches your real
+`~/.saveguard/` folder, and never makes a network request.
 
-## How it works
+See [BUILDING.md](BUILDING.md#running-the-tests) for what the suite covers, the
+fixtures that guarantee that isolation, and how to write new UI tests against it.
 
-1. Click **"Add Game"**, give it a name, and select:
-   - The **save folder** the game writes to (e.g. `%USERPROFILE%\Saved Games\CD Projekt Red\Cyberpunk 2077`)
-   - A **backup destination** folder (e.g. a folder on an external drive or cloud-synced folder)
-2. Click **"Backup Now"** on a game card to compress the current save state into a new timestamped `.zip` archive inside your chosen destination (e.g. `2026-09-11_20-30-00.zip`). Compression keeps backups small without needing any extra tools — just double-click the archive in your file explorer to open or extract it.
-3. Next time you launch SaveGuard (e.g. after a play session), it automatically rescans every tracked save folder. If the save data changed since the last backup, the card shows a **"Changes detected"** badge and a banner appears prompting you to back up again.
-4. Use **"Open Backups"** to jump straight to the backup folder in your file explorer, or **"Rescan"** anytime to manually re-check for changes. Use **"Backup All"** (in the header or the alert banner) to back up every game with pending changes in one click.
+---
+
+## Building a Windows installer
+
+PyInstaller does not cross-compile, so a Windows `.exe` has to be built on a
+Windows machine. Full instructions are in [BUILDING.md](BUILDING.md).
+
+---
 
 ## Notes
 
-- Change detection compares file size + modification time for every file in the save folder — fast and reliable without needing to hash large save files, and it never has to open the backup archive to work: it always compares against the live save folder.
-- Backups are stored as compressed `.zip` archives (one per backup) rather than plain folder copies, to keep disk usage down. Compression levels 0-8 use the standard DEFLATE algorithm (opens with anything — Explorer, Finder, any zip tool). Level 9 ("Maximum") switches to LZMA for meaningfully smaller files, which is a standard part of the zip format but isn't recognized by every minimal zip tool — 7-Zip and most modern archive tools handle it without issue, but if you ever need to open a "Maximum"-level backup manually and your usual tool can't read it, try 7-Zip.
-- Removing a game from SaveGuard only stops tracking it; it never deletes any backup files already created.
-- All of SaveGuard's own data (tracked games, settings, and a small crash log if anything ever goes wrong) lives in `~/.saveguard/` and is written atomically — an interrupted write (crash, power loss) can't leave that data corrupted. Find the exact path anytime from **Settings → About**.
+**Compression levels.** Levels 0–8 use DEFLATE, which every zip tool
+understands. Level 9 (*Maximum*) uses LZMA, which produces meaningfully smaller
+archives but is not recognised by minimal zip utilities — 7-Zip and most modern
+tools handle it fine. If a *Maximum* backup will not open with your usual tool,
+that is why.
+
+**Removing a game** stops tracking it and deletes nothing. Archives already
+written stay exactly where they are.
+
+**Updates.** The app checks GitHub Releases once a day at most, in the background,
+and only asks when a newer version exists. No update is ever downloaded or
+installed without you saying yes.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
