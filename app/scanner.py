@@ -52,7 +52,7 @@ def build_snapshot(root_path: str) -> Snapshot:
     if not root_path or not os.path.isdir(root_path):
         return snapshot
 
-# Guards against a directory cycle (most realistically a Windows
+    # Guards against a directory cycle (most realistically a Windows
     # junction pointing at its own ancestor, which looks like a plain
     # directory to is_dir(follow_symlinks=False) and would otherwise walk
     # forever) -- see mark_visited for why identity, not the link check.

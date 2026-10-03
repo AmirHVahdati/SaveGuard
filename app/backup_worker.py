@@ -14,6 +14,7 @@ safe cleanup (see MainWindow._on_backup_requested). Naming our own signal
 `finished` would shadow it and risk destroying the thread object while it's
 still technically running."""
 
+import errno
 import os
 import re
 import zipfile
@@ -44,6 +45,31 @@ DEFAULT_COMPRESS_LEVEL = 6
 # refused outright by the paths_conflict check in run(), and the destination
 # is pruned from the walk, so this pattern is no longer load-bearing for it.
 _BACKUP_FILENAME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.zip$")
+
+# Error codes that mean "this path is too long", and the POSIX equivalent.
+# 206 is ERROR_FILENAME_EXCED_RANGE ("The filename or extension is too long"),
+# which is what a path past MAX_PATH's 260 characters produces on a Windows
+# install without long path support; 123 is ERROR_INVALID_NAME, what an
+# over-long single path component produces. ENAMETOOLONG is the same complaint
+# from POSIX.
+#
+# Deliberately narrow. ERROR_PATH_NOT_FOUND (3) also covers a directory deleted
+# while the walk was running, and ERROR_ACCESS_DENIED (5) a folder the user
+# simply cannot read -- neither is a path-length problem, and retrying actually
+# fixes both, so treating them as one would fail backups over conditions that
+# resolve themselves.
+_PATH_LENGTH_WINERRORS = frozenset({206, 123})
+_PATH_LENGTH_ERRNOS = frozenset({errno.ENAMETOOLONG})
+
+
+def _is_path_length_error(exc: OSError) -> bool:
+    """True if `exc` is the filesystem reporting a path that is too long."""
+    # A live Win32 call populates both attributes -- measured winerror=123
+    # alongside errno=EINVAL -- so winerror is checked first and errno covers
+    # the POSIX case, where it is the only one set.
+    if getattr(exc, "winerror", None) in _PATH_LENGTH_WINERRORS:
+        return True
+    return exc.errno in _PATH_LENGTH_ERRNOS
 
 
 def _compression_for_level(level: int):
@@ -320,7 +346,19 @@ class BackupWorker(QThread):
             # timestamped archives this app recognises.
             visited_dirs: set = set()
             mark_visited(visited_dirs, self.save_path)
-            for dirpath, dirnames, filenames in os.walk(self.save_path):
+            # os.walk swallows an OSError from scandir unless it is given an
+            # onerror handler, which leaves a folder it could not read
+            # indistinguishable from one holding no files. That matters more
+            # than it looks: _verify_backup_archive checks the archive against
+            # the list built by *this* walk, so a walk that silently skipped a
+            # subtree produces an archive that verifies as complete while
+            # missing saves. A path-length failure is the one case worth
+            # refusing over, because retrying cannot fix it and the folder's
+            # depth is a property of where the game keeps its saves.
+            unreachable: List[OSError] = []
+            for dirpath, dirnames, filenames in os.walk(
+                self.save_path, onerror=unreachable.append
+            ):
                 dirnames[:] = [
                     d for d in dirnames
                     if not d.startswith(".")
@@ -339,6 +377,28 @@ class BackupWorker(QThread):
                     if os.path.islink(os.path.join(dirpath, fname)):
                         continue
                     files.append(os.path.join(dirpath, fname))
+
+            # Raised before the archive is opened, so a refused backup leaves
+            # nothing behind at all rather than a partial .zip that looks like
+            # a backup. run()'s handler turns this into an error signal, and
+            # the save folder is untouched, so the fix is to retry once the
+            # path is shorter or long path support is on.
+            too_long = [exc for exc in unreachable if _is_path_length_error(exc)]
+            if too_long:
+                example = getattr(too_long[0], "filename", None) or self.save_path
+                raise OSError(
+                    f"“{self.game_name}” keeps part of its saves in a folder "
+                    f"Windows can't reach, because the path runs past the "
+                    f"260-character limit:\n\n{example}\n\n"
+                    f"{len(too_long)} folder(s) would have been left out, so "
+                    f"the backup would have been quietly incomplete. Nothing "
+                    f"has been written and your earlier backups are "
+                    f"untouched.\n\n"
+                    f"Either point SaveGuard at a shorter folder, or turn on "
+                    f"Windows' long path support (LongPathsEnabled under "
+                    f"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem, or "
+                    f"the equivalent Group Policy setting) and restart SaveGuard."
+                )
 
             compression, compresslevel = _compression_for_level(self.compression_level)
 

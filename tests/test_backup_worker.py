@@ -12,6 +12,7 @@ Two things are worth knowing about how these tests drive the worker:
   backup in the app.
 """
 
+import errno
 import os
 import sys
 import zipfile
@@ -21,7 +22,8 @@ import pytest
 
 from app.backup_worker import (
     BackupWorker, _arcname_key, _BACKUP_FILENAME_PATTERN,
-    _compression_for_level, _is_forbidden_save_path, _verify_backup_archive,
+    _compression_for_level, _is_forbidden_save_path, _is_path_length_error,
+    _verify_backup_archive,
 )
 from app.scanner import build_snapshot
 
@@ -87,6 +89,46 @@ def seed_backups(backup_root, count, first_year=2000):
 
 def backup_names(backup_root):
     return sorted(p.name for p in Path(backup_root).iterdir() if p.is_file())
+
+
+def win_error(winerror, err=errno.EINVAL, msg="synthetic"):
+    """An OSError shaped like a real one produced by Windows.
+
+    CPython fills *both* attributes from a live Win32 call -- measured
+    winerror=123 alongside errno=EINVAL -- so a test that sets only errno, as
+    OSError(206, "...") does, doesn't resemble the real thing and would
+    misreport what the predicate is being asked to classify.
+    """
+    exc = OSError(err, msg)
+    exc.winerror = winerror
+    return exc
+
+
+def scandir_failing_for(subdir, exc):
+    """A scandir replacement that raises `exc` for one subdirectory only.
+
+    Long paths can't be reproduced by building a deep tree on a machine with
+    long path support enabled (this one has it on), and MAX_PATH is not the
+    only thing that makes a folder unreadable, so the failure is injected at
+    the same point the OS would raise it: the scandir that os.walk makes while
+    descending. `exc.filename` is filled in the way a real one is, since the
+    error message reports it back to the user.
+    """
+    real_scandir = os.scandir
+
+    def fake_scandir(path):
+        path = str(path)
+        if os.path.basename(path) == subdir:
+            exc.filename = path
+            raise exc
+        return real_scandir(path)
+
+    return fake_scandir
+
+
+def archived_names(result):
+    with zipfile.ZipFile(result.finished.last[3]) as zf:
+        return sorted(_arcname_key(name) for name in zf.namelist())
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +603,135 @@ class TestFailedBackup:
         result = run_backup(save_root, backup_root)
         assert not result.finished
         assert "No space left" in result.errors.last[1]
+
+
+# ---------------------------------------------------------------------------
+# folders the walk could not reach
+# ---------------------------------------------------------------------------
+
+class TestIsPathLengthError:
+    @pytest.mark.parametrize("winerror, expected", [
+        (206, True),   # ERROR_FILENAME_EXCED_RANGE: past MAX_PATH
+        (123, True),   # ERROR_INVALID_NAME: over-long single component
+        (3, False),    # ERROR_PATH_NOT_FOUND: folder deleted mid-walk
+        (5, False),    # ERROR_ACCESS_DENIED: user can't read it
+        (32, False),   # ERROR_SHARING_VIOLATION: another process has it open
+    ])
+    def test_win32_codes_are_classified(self, winerror, expected):
+        assert _is_path_length_error(win_error(winerror)) is expected
+
+    def test_posix_reports_the_same_problem_as_enametoolong(self):
+        # Only errno is set on POSIX, which is why it is checked as well.
+        assert _is_path_length_error(OSError(errno.ENAMETOOLONG, "File name too long")) is True
+
+    @pytest.mark.parametrize("err", [
+        errno.ENOENT, errno.EACCES, errno.ENOSPC, errno.ELOOP,
+    ])
+    def test_unrelated_errno_values_are_not_path_length_problems(self, err):
+        # Widening this predicate would fail backups over conditions that a
+        # retry genuinely fixes.
+        assert _is_path_length_error(OSError(err, "unrelated")) is False
+
+
+class TestPathTooLongIsRefused:
+    """A walk that cannot reach part of the save folder must not report success.
+
+    _verify_backup_archive compares the archive against the list built by the
+    same walk, so a silently truncated walk verifies as complete -- the one gap
+    the completeness check cannot catch. Failing is the only thing that keeps
+    a partial archive from being badged "Up to date" and never revisited.
+    """
+    SUBDIR = "SaveData"
+
+    def _refuse(self, monkeypatch, exc=None):
+        import app.backup_worker as worker_module
+
+        monkeypatch.setattr(
+            worker_module.os, "scandir",
+            scandir_failing_for(
+                self.SUBDIR,
+                exc if exc is not None else win_error(
+                    206, errno.EINVAL, "The filename or extension is too long"
+                ),
+            ),
+        )
+
+    def test_a_too_long_path_fails_the_backup(self, save_root, backup_root,
+                                              run_backup, monkeypatch):
+        self._refuse(monkeypatch)
+        result = run_backup(save_root, backup_root)
+        assert not result.finished
+        assert "260-character limit" in result.errors.last[1]
+
+    def test_the_message_names_the_folder_it_could_not_reach(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        self._refuse(monkeypatch)
+        result = run_backup(save_root, backup_root)
+        assert self.SUBDIR in result.errors.last[1]
+
+    def test_no_partial_archive_is_left_behind(self, save_root, backup_root,
+                                               run_backup, monkeypatch):
+        self._refuse(monkeypatch)
+        run_backup(save_root, backup_root)
+        # Refused before the archive is opened, so there is no .zip to mistake
+        # for a backup of a folder that was only partly read.
+        assert list(backup_root.glob("*.zip")) == []
+
+    def test_refusing_never_prunes_previous_ones(self, save_root, backup_root,
+                                                  run_backup, monkeypatch):
+        self._refuse(monkeypatch)
+        seed_backups(backup_root, 3)
+        result = run_backup(save_root, backup_root, max_backups=1)
+        assert not result.finished
+        # The same reasoning as a failed verification: retention deletes the
+        # oldest *good* archives, so a refusal must not cost the user the ones
+        # they already have.
+        assert len(backup_names(backup_root)) == 3
+
+    def test_the_save_folder_is_never_modified(self, save_root, backup_root,
+                                               run_backup, monkeypatch):
+        self._refuse(monkeypatch)
+        before = build_snapshot(str(save_root))
+        run_backup(save_root, backup_root)
+        assert build_snapshot(str(save_root)) == before
+
+
+class TestOtherWalkErrorsStayTolerated:
+    """Everything that isn't a path-length problem keeps today's behaviour.
+
+    A folder deleted while the walk was running, or one the user simply cannot
+    read, is worth skipping rather than failing over -- retrying fixes both,
+    and a save folder with one locked subfolder should still back up.
+    """
+    SUBDIR = "SaveData"
+
+    def test_a_permission_error_does_not_fail_the_backup(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        import app.backup_worker as worker_module
+
+        monkeypatch.setattr(
+            worker_module.os, "scandir",
+            scandir_failing_for(self.SUBDIR, win_error(5, errno.EACCES, "Access is denied")),
+        )
+        result = run_backup(save_root, backup_root)
+
+        assert result.finished, result.errors.last
+        names = archived_names(result)
+        assert "slot1.sav" in names
+        assert not any(name.startswith(self.SUBDIR) for name in names)
+
+    def test_a_folder_deleted_mid_walk_does_not_fail_the_backup(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        import app.backup_worker as worker_module
+
+        monkeypatch.setattr(
+            worker_module.os, "scandir",
+            scandir_failing_for(self.SUBDIR, win_error(3, errno.ENOENT, "no such path")),
+        )
+        result = run_backup(save_root, backup_root)
+
+        assert result.finished, result.errors.last
+        assert "settings.ini" in archived_names(result)
 
 
 # ---------------------------------------------------------------------------
