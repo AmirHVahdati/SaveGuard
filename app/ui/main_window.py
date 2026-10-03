@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl, QEvent
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QLineEdit, QMessageBox, QFrame
+    QScrollArea, QLineEdit, QMessageBox, QFrame, QSpacerItem, QSizePolicy
 )
 
 from app.config import load_games, save_games, load_state, save_state, load_settings, save_settings
@@ -37,9 +37,12 @@ SUPPORT_URL = "https://donatr.ee/amirvahdati/"
 # so cards don't pop in/out abruptly while scrolling.
 VIRTUAL_BUFFER = 3
 
-# Approximate height of a GameCard in pixels (including vertical margin/spacing)
-# Used to estimate which cards are visible during scroll.
-CARD_HEIGHT = 268  # card height (~240) + margin/spacing
+# Nominal height of a GameCard in pixels (including vertical margin/spacing).
+# Only a starting estimate: once the list has been laid out, the real slot pitch
+# comes from the scrollbar's own content height (see _slot_pitch). It is
+# deliberately on the generous side, because guessing too small risks showing
+# fewer cards than fit rather than more.
+CARD_HEIGHT = 268  # a card is closer to 128px; this is a conservative bound
 
 
 class MainWindow(QMainWindow):
@@ -105,6 +108,14 @@ class MainWindow(QMainWindow):
         self.scroll.setWidget(self.list_container)
         self.scroll.installEventFilter(self)
         root.addWidget(self.scroll, 1)
+
+        # Vertical space one list slot occupies, excluding the layout spacing
+        # that follows it. A slot is either a real GameCard or a spacer of this
+        # height, so a pixel offset maps to the same list index whether or not
+        # that game currently has a card. Filled in from a real card as soon as
+        # one is built. See _sync_visible_cards.
+        self._slot_height = 0
+        self._slot_ids: set = set()  # games holding a layout slot, card or spacer
 
         self.status_bar = self.statusBar()
 
@@ -234,6 +245,8 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         self.cards.clear()
         self._all_game_ids.clear()
+        self._slot_ids.clear()
+        self._slot_height = 0
 
         if not self.games:
             empty = QLabel(
@@ -253,81 +266,172 @@ class MainWindow(QMainWindow):
             for game in sorted_games:
                 self._add_card_for_game(game)
         else:
-            # Large list: create only initially visible cards, defer the rest
-            self._create_visible_cards()
+            # Large list: build the cards in view, then leave a slot of the
+            # same height behind for every game that doesn't have one. Those
+            # slots are what keep the scroll area as tall as the whole list --
+            # without them the scrollbar's range shrinks to the handful of
+            # cards that exist, and the tail of a long list becomes impossible
+            # to scroll to.
+            self._sync_visible_cards()
+            self._fill_missing_slots()
 
-    def _create_visible_cards(self):
-        """Create GameCard widgets only for games currently visible in the
-        scroll viewport, plus a small buffer. Other games are tracked in
-        _all_game_ids and created lazily on scroll."""
-        visible_start, visible_end = self._get_visible_range()
-        for i in range(visible_start, min(visible_end, len(self._all_game_ids))):
-            game = self.games[self._all_game_ids[i]]
-            if game.id not in self.cards:
-                self._add_card_for_game(game)
+    def _slot_spacer(self) -> QSpacerItem:
+        """A placeholder standing in for a game that has no card right now.
+
+        Sized from a real card so that materialising a card doesn't change how
+        much list there is below it. Before any card exists, fall back to the
+        estimate -- _get_visible_range() reads real geometry, so an off-by-a-bit
+        fallback can't hide games from the tail, it can only cost a small jump.
+        """
+        height = self._slot_height or max(1, CARD_HEIGHT - self.list_layout.spacing())
+        return QSpacerItem(0, height, QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+    def _fill_missing_slots(self):
+        """Give every tracked game a layout slot, so layout position N always
+        corresponds to _all_game_ids[N]."""
+        for game_id in self._all_game_ids:
+            if game_id in self._slot_ids:
+                continue
+            index = self._all_game_ids.index(game_id)
+            self.list_layout.insertItem(index, self._slot_spacer())
+            self._slot_ids.add(game_id)
+
+    def _take_slot(self, index: int):
+        """Remove and return the layout item at `index`, destroying its widget.
+
+        Used both when a card takes over a spacer's place and when a game
+        leaves the list entirely, so that layout position N always corresponds
+        to _all_game_ids[N].
+        """
+        if index < 0 or index >= self.list_layout.count():
+            return None
+        item = self.list_layout.takeAt(index)
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+        return item
 
     def _add_card_for_game(self, game: Game):
-        """Create and insert a single GameCard for the given game at the
-        correct sorted position."""
+        """Create and insert a single GameCard for the given game at its
+        position in the list.
+
+        The layout holds exactly one item per entry of _all_game_ids — a card
+        where the game has one, a spacer where it doesn't — so a game's position
+        is simply its index, and adding a card never disturbs the games around
+        it.
+        """
         status = self.status_cache.get(game.id, "never")
         card = GameCard(game, status)
         card.backup_requested.connect(self._on_backup_requested)
         card.edit_requested.connect(self._on_edit_game)
         card.remove_requested.connect(self._on_remove_game)
         card.color_changed.connect(self._on_color_changed)
-        self.cards[game.id] = card
+        self._slot_height = card.sizeHint().height() or self._slot_height
 
-        # Track in _all_game_ids for virtual scrolling (insert at correct
-        # sorted position so the list stays ordered by game name)
-        if game.id not in self._all_game_ids:
+        if game.id in self._all_game_ids:
+            index = self._all_game_ids.index(game.id)
+            if game.id in self._slot_ids:
+                # Scrolled back into view: the game already holds a spacer that
+                # the card takes over. A game with no slot yet is the first
+                # build of a long list — there is nothing to take.
+                self._take_slot(index)
+        else:
+            # Newly tracked game: claim its sorted position and let the card
+            # occupy the slot that position implies.
+            index = len(self._all_game_ids)
             target_name = game.name.lower()
-            inserted = False
-            for i, gid in enumerate(self._all_game_ids):
-                existing_game = self.games.get(gid)
+            for position, existing_id in enumerate(self._all_game_ids):
+                existing_game = self.games.get(existing_id)
                 if existing_game and existing_game.name.lower() > target_name:
-                    self._all_game_ids.insert(i, game.id)
-                    inserted = True
+                    index = position
                     break
-            if not inserted:
-                self._all_game_ids.append(game.id)
+            self._all_game_ids.insert(index, game.id)
 
-        # Insert in sorted position to maintain ordering without full rebuild
-        insert_pos = 0
-        target_name = game.name.lower()
-        for i in range(self.list_layout.count() - 1):  # skip trailing stretch
-            widget = self.list_layout.itemAt(i).widget()
-            if isinstance(widget, GameCard) and widget.game.name.lower() < target_name:
-                insert_pos = i + 1
-            else:
-                break
-        self.list_layout.insertWidget(insert_pos, card)
+        self.cards[game.id] = card
+        self._slot_ids.add(game.id)
+        self.list_layout.insertWidget(index, card)
 
     def _remove_card_for_game(self, game_id: str):
-        """Remove and clean up the GameCard for the given game."""
-        card = self.cards.pop(game_id, None)
-        if card:
-            self.list_layout.removeWidget(card)
-            card.deleteLater()
+        """Remove and clean up the GameCard for the given game.
+
+        The slot goes too: a game that is no longer tracked must not keep
+        reserving a card's worth of scroll height."""
+        self.cards.pop(game_id, None)
         if game_id in self._all_game_ids:
-            self._all_game_ids.remove(game_id)
+            index = self._all_game_ids.index(game_id)
+            self._all_game_ids.pop(index)
+            self._take_slot(index)
+            self._slot_ids.discard(game_id)
+
+    def _slot_pitch(self) -> float:
+        """Average vertical distance from one slot to the next.
+
+        Derived from the scrollbar's own numbers -- the full content height is
+        its maximum plus its page step -- rather than from the layout's item
+        geometry. Item geometry is only trustworthy after Qt has laid the list
+        out, and the sync that asks for it is usually the very thing that
+        invalidated it, so reading positions mid-sync falls back to estimates
+        that disagree with the real layout. The scrollbar always agrees with
+        it, which is what keeps the tail of a long list reachable: at maximum
+        scroll the last slot's position is inside the range by construction.
+
+        Before the first layout there are no numbers to divide, so fall back to
+        the nominal card height. That estimate can only cost a slightly wrong
+        fetch window; it cannot hide games, because the scrollbar's range is
+        what decides how far the list can be scrolled either way.
+        """
+        total = len(self._all_game_ids)
+        if not total:
+            return 0.0
+        fallback = self._slot_height or max(1, CARD_HEIGHT - self.list_layout.spacing())
+        scrollbar = self.scroll.verticalScrollBar()
+        content = (scrollbar.maximum() + scrollbar.pageStep()) if scrollbar else 0
+        # A scrollbar that has never been laid out reports a page step but no
+        # range. Dividing that stub height by the game count would call every
+        # slot visible and quietly un-virtualize the whole list.
+        if content > total * fallback:
+            return content / total
+        return fallback + self.list_layout.spacing()
+
+    def _slot_edges(self) -> list[tuple[int, int]]:
+        """(top, bottom) of every tracked slot, in list order."""
+        pitch = self._slot_pitch()
+        fallback = self._slot_height or max(1, CARD_HEIGHT - self.list_layout.spacing())
+        edges = []
+        top = 0.0
+        for _ in self._all_game_ids:
+            edges.append((int(top), int(top) + fallback))
+            top += pitch
+        return edges
 
     def _get_visible_range(self) -> tuple[int, int]:
-        """Return (start_index, end_index) of visible games based on scroll position."""
+        """Return (start_index, end_index) of the slots currently in view.
+
+        Measured against the slots' real positions rather than by dividing the
+        scroll offset by an assumed card height, and with the buffer applied in
+        pixels for the same reason.
+        """
+        total = len(self._all_game_ids)
+        if total == 0:
+            return 0, 0
+
+        edges = self._slot_edges()
         scrollbar = self.scroll.verticalScrollBar()
-        if not scrollbar:
-            return 0, len(self._all_game_ids)
+        if not scrollbar or not edges:
+            return 0, total
 
-        # Estimate which items are visible based on scroll position
-        # Each card is approximately CARD_HEIGHT pixels tall
-        offset = scrollbar.value()
-        page_size = scrollbar.pageStep()
+        pad = self._slot_height or max(1, CARD_HEIGHT - self.list_layout.spacing())
+        viewport_top = scrollbar.value() - VIRTUAL_BUFFER * pad
+        viewport_bottom = viewport_top + scrollbar.pageStep() + 2 * VIRTUAL_BUFFER * pad
 
-        start = max(0, offset // CARD_HEIGHT - VIRTUAL_BUFFER)
-        # Add buffer items
-        visible_count = max(1, (page_size // CARD_HEIGHT) + 2 * VIRTUAL_BUFFER)
-        end = min(len(self._all_game_ids), start + visible_count)
+        start = 0
+        while start < total and edges[start][1] <= viewport_top:
+            start += 1
+        end = start
+        while end < total and edges[end][0] < viewport_bottom:
+            end += 1
 
-        return start, end
+        return start, max(start, end)
 
     def eventFilter(self, obj, event):
         """Intercept resize events on the scroll area to trigger card sync."""
@@ -360,9 +464,15 @@ class MainWindow(QMainWindow):
             gid for gid in self.cards.keys() if gid not in ids_to_keep
         ]
         for game_id in ids_to_remove:
-            card = self.cards.pop(game_id)
-            self.list_layout.removeWidget(card)
-            card.deleteLater()
+            self._virtualize_card(game_id)
+
+    def _virtualize_card(self, game_id: str):
+        """Drop a card that has scrolled too far out of view, leaving its slot
+        behind so the game's position in the list doesn't move."""
+        self.cards.pop(game_id, None)
+        index = self._all_game_ids.index(game_id)
+        self._take_slot(index)
+        self.list_layout.insertItem(index, self._slot_spacer())
 
     def _on_scroll(self, value: int):
         """Handle scroll events for virtual scrolling."""
@@ -687,8 +797,7 @@ class MainWindow(QMainWindow):
 
     def _on_backup_requested(self, game_id: str):
         game = self.games.get(game_id)
-        card = self.cards.get(game_id)
-        if not game or not card:
+        if not game:
             return
         if game_id in self.workers:
             return  # already backing up
@@ -697,7 +806,14 @@ class MainWindow(QMainWindow):
                                  f"The save folder for “{game.name}” could not be found:\n{game.save_path}")
             return
 
-        card.set_backing_up(True)
+        # A game scrolled out of view has no card right now. That is not a
+        # reason to refuse the backup: "Backup All" drives every game in the
+        # library through here, and above the virtualization threshold most of
+        # them have no card at any given moment. The card is only for showing
+        # progress, and _on_backup_finished puts it back when it returns.
+        card = self.cards.get(game_id)
+        if card:
+            card.set_backing_up(True)
         worker = BackupWorker(
             game.id, game.name, game.save_path, game.backup_root,
             compression_level=clamp_compression_level(self.settings.get("compression_level")),

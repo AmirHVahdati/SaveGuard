@@ -470,6 +470,56 @@ class TestCardList:
         main_window.scroll.resize(400, 400)
         main_window._sync_visible_cards()  # must not raise or recurse forever
 
+    def test_every_game_holds_a_slot_even_without_a_card(self, main_window, tmp_path):
+        # Layout position N has to correspond to _all_game_ids[N], whether that
+        # slot holds a card or a spacer. If it doesn't, cards get inserted in the
+        # wrong place as you scroll.
+        for index in range(120):
+            make_game(main_window, f"Game {index:03d}", tmp_path / f"s{index}")
+        main_window._rebuild_cards()
+        assert len(main_window.cards) < 120
+        # one item per game, plus the trailing stretch
+        assert main_window.list_layout.count() == len(main_window._all_game_ids) + 1
+
+    def test_slots_and_cards_stay_in_step_when_scrolling(self, main_window, tmp_path,
+                                                          monkeypatch):
+        for index in range(120):
+            make_game(main_window, f"Game {index:03d}", tmp_path / f"s{index}")
+        main_window._rebuild_cards()
+        monkeypatch.setattr(main_window, "_get_visible_range", lambda: (100, 110))
+        main_window._sync_visible_cards()
+        assert main_window.list_layout.count() == len(main_window._all_game_ids) + 1
+
+    def test_removing_a_game_frees_its_slot(self, main_window, tmp_path):
+        for index in range(120):
+            make_game(main_window, f"Game {index:03d}", tmp_path / f"s{index}")
+        main_window._rebuild_cards()
+        victim = main_window._all_game_ids[-1]
+        main_window._remove_card_for_game(victim)
+        assert victim not in main_window._all_game_ids
+        assert victim not in main_window._slot_ids
+        assert main_window.list_layout.count() == len(main_window._all_game_ids) + 1
+
+    def test_the_last_game_is_in_view_at_the_bottom_of_the_scroll(self, main_window,
+                                                                  tmp_path, qtbot):
+        # The original bug: the scroll area was only as tall as the handful of
+        # cards that existed, so the offset needed to bring the tail of a long
+        # list into view was never reachable and those games could not be seen.
+        for index in range(120):
+            make_game(main_window, f"Game {index:03d}", tmp_path / f"s{index}")
+        main_window._rebuild_cards()
+        main_window.show()
+        qtbot.wait(50)
+
+        scrollbar = main_window.scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        main_window._sync_visible_cards()
+
+        start, end = main_window._get_visible_range()
+        assert start < len(main_window._all_game_ids)
+        assert end == len(main_window._all_game_ids)
+        assert main_window._all_game_ids[-1] in main_window.cards
+
 
 class TestSearch:
     @pytest.fixture
@@ -717,10 +767,16 @@ class TestBackupRequest:
     def test_an_unknown_game_id_is_ignored(self, main_window):
         main_window._on_backup_requested("not-a-game")  # must not raise
 
-    def test_a_game_with_no_card_is_ignored(self, main_window, save_root):
+    def test_a_game_with_no_card_is_still_backed_up(self, main_window, save_root,
+                                                    fake_workers):
+        # Above the virtualization threshold most of the library has no card at
+        # any given moment. That must not stop a backup: "Backup All" drives
+        # every game through here.
         game = make_game(main_window, "Hades", save_root)
+        assert game.id not in main_window.cards
         main_window._on_backup_requested(game.id)
-        assert game.id not in main_window.workers
+        assert game.id in main_window.workers
+        assert fake_workers.instances[-1].game_id == game.id
 
     def test_settings_are_clamped_before_the_worker_starts(
             self, tracked, main_window, fake_workers):
@@ -875,6 +931,25 @@ class TestBackupAll:
         qtbot.waitUntil(lambda: bool(requested), timeout=2000)
         # It is already in flight, so queueing it again would double up.
         assert running.id not in requested
+
+    def test_covers_games_whose_cards_are_virtualized(self, main_window, tmp_path,
+                                                      save_root, qtbot, fake_workers):
+        # The regression this guards: a game scrolled out of view has no card,
+        # and Backup All used to skip every one of those — reporting a count
+        # that included them while backing up almost nothing.
+        games = []
+        for index in range(3):
+            game = make_game(main_window, f"Game {index}", save_root)
+            main_window.status_cache[game.id] = "changed"
+            games.append(game)
+        assert not any(game.id in main_window.cards for game in games)
+
+        main_window._on_backup_all()
+        qtbot.waitUntil(lambda: len(fake_workers.instances) == 3, timeout=2000)
+        assert {worker.game_id for worker in fake_workers.instances} == {
+            game.id for game in games
+        }
+        assert main_window.backup_all_btn.isEnabled() is True
 
     def test_the_button_comes_back_afterwards(self, main_window, tmp_path, qtbot):
         stage_never_backed_up_games(main_window, tmp_path)
