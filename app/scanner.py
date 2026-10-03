@@ -114,9 +114,30 @@ def _same_mtime(previous, current) -> bool:
 
 
 def snapshots_differ(old: Optional[Snapshot], new: Snapshot) -> bool:
-    """True if the new snapshot has any file added, removed, or modified vs old."""
+    """True if the new snapshot has any file added, removed, or modified vs old.
+
+    A missing baseline (old is None) counts as different. There is nothing to
+    compare against, so nothing supports claiming these saves are unchanged --
+    and "unchanged" is the answer that quietly stops backups happening, while
+    "changed" only ever costs one redundant backup.
+
+    This is reachable, not theoretical: last_snapshot and last_backup_time are
+    persisted as two independent keys (Game.from_dict), so nothing stops a
+    truncated or hand-edited games.json carrying a backup timestamp with no
+    snapshot behind it. That combination used to report "synced" permanently
+    -- the game looked fine, its saves changed, new files appeared, and nothing
+    ever prompted another backup.
+
+    It does not alter the "never backed up" status. MainWindow._compute_status
+    returns "never" when last_backup_time is None without reaching this call,
+    so for a consistently untouched game (both fields None) nothing changes.
+    Returning True is what makes that ordering safe to rely on rather than
+    load-bearing: if a later refactor drops or reorders the guard, the worst
+    case becomes a redundant backup rather than a game that silently stops
+    being backed up.
+    """
     if old is None:
-        return False  # "never backed up" is tracked separately, not as a diff
+        return True
     if set(old.keys()) != set(new.keys()):
         return True
     for key, value in new.items():
