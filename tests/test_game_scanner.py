@@ -42,6 +42,20 @@ def discovery_does_not_walk_real_system_folders(monkeypatch):
 ACF_TEMPLATE = '"AppState"\n{{\n\t"appid"\t\t"{appid}"\n\t"name"\t\t"{name}"\n}}\n'
 
 
+def write_acf(steam_root, appid, content):
+    """Write one appmanifest verbatim.
+
+    ACF_TEMPLATE goes through str.format(), which can't express the brace-heavy
+    and escape-heavy manifests these tests need, so those are written as raw
+    bytes (or str, encoded as UTF-8) instead.
+    """
+    steamapps = Path(steam_root) / "steamapps"
+    steamapps.mkdir(parents=True, exist_ok=True)
+    data = content if isinstance(content, bytes) else content.encode("utf-8")
+    (steamapps / f"appmanifest_{appid}.acf").write_bytes(data)
+    return steamapps / f"appmanifest_{appid}.acf"
+
+
 def names_of(candidates):
     return sorted(c.name for c in candidates)
 
@@ -496,6 +510,134 @@ class TestReadSteamAppNames:
     def test_names_with_punctuation_are_read_whole(self, tmp_path):
         steam = make_steam_install(tmp_path / "Steam", apps={"620": "Portal 2"})
         assert _read_steam_app_names(str(steam))["620"] == "Portal 2"
+
+    # -----------------------------------------------------------------------
+    # ACF has a real grammar (Valve KeyValues). A plain regex over the raw
+    # text used to read it wrong rather than not at all: the first "name"
+    # anywhere in the file won, so a nested depot key outranked the game's,
+    # an escaped quote cut the name short, and a multi-line value or a
+    # differently-cased key parsed as no name at all.
+    # -----------------------------------------------------------------------
+
+    def test_nested_depot_name_does_not_win(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "555", (
+            '"AppState"\n{\n'
+            '\t"InstalledDepots"\n\t{\n\t\t"1"\n\t\t{\n'
+            '\t\t\t"name"\t\t"A Depot, Not The Game"\n'
+            '\t\t}\n\t}\n'
+            '\t"name"\t\t"Real Game Name"\n}\n'
+        ))
+        assert _read_steam_app_names(str(steam))["555"] == "Real Game Name"
+
+    def test_name_only_present_in_a_nested_block_is_not_the_app_name(self, tmp_path):
+        # A UserConfig/depot "name" describes that block, so a manifest with
+        # nothing at the top level resolves to no name rather than to one of
+        # them -- a missing game, which callers already handle, instead of a
+        # confidently mislabelled one.
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "556", (
+            '"AppState"\n{\n\t"UserConfig"\n\t{\n'
+            '\t\t"name"\t\t"Someone\'s Profile"\n\t}\n}\n'
+        ))
+        assert _read_steam_app_names(str(steam)) == {}
+
+    def test_escaped_quotes_stay_in_the_name(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "557", '"AppState"\n{\n\t"name"\t\t"He said \\"hi\\""\n}\n')
+        assert _read_steam_app_names(str(steam))["557"] == 'He said "hi"'
+
+    def test_multiline_value_is_flattened(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "558", '"AppState"\n{\n\t"name"\t\t"""Wrapped\nName"""\n}\n')
+        assert _read_steam_app_names(str(steam))["558"] == "Wrapped Name"
+
+    def test_key_case_is_ignored_like_steam_ignores_it(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "559", '"AppState"\n{\n\t"appid"\t"559"\n\t"Name"\t"Cased"\n}\n')
+        assert _read_steam_app_names(str(steam))["559"] == "Cased"
+
+    def test_comments_are_not_mistaken_for_keys(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "560", (
+            '// "name"\t"Commented Out"\n"AppState"\n{\n'
+            '\t// the "name" above is not the one we want\n'
+            '\t"name"\t\t"Real"\n}\n'
+        ))
+        assert _read_steam_app_names(str(steam))["560"] == "Real"
+
+    def test_non_utf8_manifest_keeps_its_name(self, tmp_path):
+        # Steam writes UTF-8, but older manifests went out in the game's own
+        # Windows codepage. Dropping the undecodable bytes (as reading the
+        # file as UTF-8 with errors="ignore" did) silently renamed the game.
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "561",
+                  '"AppState"\n{\n\t"name"\t\t"Caf\xe9 Noir"\n}\n'.encode("cp1252"))
+        assert _read_steam_app_names(str(steam))["561"] == "Caf\u00e9 Noir"
+
+    def test_byte_order_mark_is_tolerated(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "562",
+                  b"\xef\xbb\xbf" + b'"AppState"\n{\n\t"name"\t\t"Bom Game"\n}\n')
+        assert _read_steam_app_names(str(steam))["562"] == "Bom Game"
+
+    def test_manifest_written_on_one_line_still_parses(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "563", '"AppState"\t{\n"name"\t"Compact"\n}\n')
+        assert _read_steam_app_names(str(steam))["563"] == "Compact"
+
+    def test_platform_conditional_in_front_of_a_value(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam")
+        write_acf(steam, "564",
+                  '"AppState"\n{\n\t"name"\t[$WIN32]\t"Conditional"\n}\n')
+        assert _read_steam_app_names(str(steam))["564"] == "Conditional"
+
+    def test_one_bad_manifest_does_not_hide_the_next_installed_game(self, tmp_path):
+        steam = make_steam_install(tmp_path / "Steam", apps={"570": "Dota 2"})
+        write_acf(steam, "565", b'"AppState"\n{\n\t"name"\t\t"Unterminated')
+        write_acf(steam, "566", b'"AppState"\n{\n\t"name"\t\t' + b"{" * 50000)
+        assert _read_steam_app_names(str(steam)) == {"570": "Dota 2"}
+
+    def test_oversized_manifest_is_skipped_without_being_read_whole(self, tmp_path, monkeypatch):
+        # A manifest this size isn't one Steam wrote, and reading it whole
+        # would pull the entire file into memory on the scan thread.
+        steam = make_steam_install(tmp_path / "Steam", apps={"220": "Half-Life 2"})
+        path = write_acf(steam, "999", b'"AppState"\n{\n\t"name"\t"Huge Game"\n}\n'
+                         + b"// " + b"x" * (game_scanner._ACF_MAX_BYTES + 4096) + b"\n")
+        assert os.path.getsize(path) > game_scanner._ACF_MAX_BYTES
+
+        read_sizes = []
+        real_open = open
+
+        class _CountingFile:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def read(self, size=-1):
+                data = self._handle.read(size)
+                read_sizes.append(len(data))
+                return data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self._handle.close()
+                return False
+
+        def counting_open(target, *args, **kwargs):
+            handle = real_open(target, *args, **kwargs)
+            return _CountingFile(handle) if str(target).endswith(".acf") else handle
+
+        monkeypatch.setattr(game_scanner, "open", counting_open, raising=False)
+        assert _read_steam_app_names(str(steam)) == {"220": "Half-Life 2"}
+        # One bounded read per manifest -- the small one whole, the huge one
+        # capped at the limit -- rather than a read of each file's own size.
+        # Compared as a set because directory order isn't guaranteed.
+        assert sorted(read_sizes) == [
+            os.path.getsize(steam / "steamapps" / "appmanifest_220.acf"),
+            game_scanner._ACF_MAX_BYTES + 1,
+        ]
 
 
 class TestResolveAppidName:

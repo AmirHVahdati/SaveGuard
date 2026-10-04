@@ -57,10 +57,9 @@ or an actual Steam install.
 """
 
 import os
-import re
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -777,9 +776,222 @@ def scan_appdata_style(appdata_local_root: str) -> List[ScanCandidate]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# appmanifest (Valve KeyValues, a.k.a. "ACF") parsing
+#
+# appmanifest_<appid>.acf is a plain-text KeyValues file sitting in a
+# user-writable Steam library, so it is no more trustworthy than any other
+# file a scan walks past -- but it does have a real grammar, which the
+# r'"name"\s*"([^"]+)"' search this replaced ignored. Concretely, that regex:
+#   - took whichever "name" came first, so a nested key inside an
+#     InstalledDepots block outranked the app's own name,
+#   - cut a name short at the first \\" escape,
+#   - skipped a name Steam itself would have matched, because Steam compares
+#     key names case-insensitively ("Name" is "name"),
+#   - found nothing at all in a multi-line (triple-quoted) value, and
+#   - couldn't tell a key from the same word inside a // comment.
+# The parser below reads the format instead, so a manifest resolves to its
+# real name or to nothing -- never to a plausible-looking wrong one.
+# ---------------------------------------------------------------------------
+
+# Real manifests are a few KB; the biggest (games with hundreds of depots)
+# are still well under 100 KB. Anything past this isn't one Steam wrote, so
+# reading it whole would only let a single bogus entry pull its entire
+# contents into memory and stall the scan thread.
+_ACF_MAX_BYTES = 1024 * 1024
+
+_ACF_WHITESPACE = " \t\r\n\v\f"
+
+# A backslash escape in a KeyValues string is the character after it, with
+# these four spelled out; anything else loses the backslash and is taken
+# literally (which is how \" and \\ round-trip).
+_ACF_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "v": "\v"}
+
+
+def _acf_clean_name(value: str) -> str:
+    """Flatten a raw name onto one line. A real game name contains no newline
+    or tab; those only appear when the manifest wrapped or escaped its value,
+    and a name carrying one would break the review dialog's layout instead of
+    naming anything."""
+    return " ".join(value.split())
+
+
+class _AcfParser:
+    """Just enough of Valve's KeyValues grammar to pull an appmanifest's app
+    name out, stopping as soon as it has one.
+
+    A file is a run of key/value pairs: a value is either a token (a quoted
+    string -- possibly escaped, possibly triple-quoted and multi-line -- or a
+    bare word) or a '{ ... }' block, with // running to end of line. The name
+    we want is the "name" sitting directly inside a root block, so anything
+    nested deeper is skipped whole: a depot's or UserConfig's own "name" is
+    not the game's name.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._pos = 0
+        self._len = len(text)
+
+    def app_name(self) -> Optional[str]:
+        """The first "name" directly inside a root block, or None."""
+        while True:
+            if self._next_token() is None:
+                return None
+            kind, value = self._next_value()
+            if kind == "block":
+                name = self._scan_block()
+                if name:
+                    return name
+
+    def _scan_block(self) -> Optional[str]:
+        """Scan inside a block whose '{' has already been consumed. Nested
+        blocks are counted through rather than recursed into, so no manifest
+        can drive this into the interpreter's recursion limit."""
+        while True:
+            self._skip_ignored()
+            if self._pos >= self._len:
+                return None
+            if self._text[self._pos] == "}":
+                self._pos += 1          # end of this block
+                return None
+            key = self._next_token()
+            if key is None:
+                return None
+            kind, value = self._next_value()
+            if kind == "block":
+                self._skip_block()
+                continue
+            # Steam compares keys case-insensitively, so "Name" is this same
+            # field and has to resolve the same way.
+            if kind == "string" and key.lower() == "name":
+                name = _acf_clean_name(value)
+                if name:
+                    return name
+
+    def _next_value(self) -> Tuple[str, str]:
+        """Read the value belonging to the key just read. Returns
+        ("block", "") / ("string", text) / ("none", "")."""
+        self._skip_ignored()
+        if self._pos >= self._len:
+            return "none", ""
+        if self._text[self._pos] == "{":
+            self._pos += 1
+            return "block", ""
+        if self._text[self._pos] == "[":
+            # A platform conditional ("[$WIN32]") may sit in front of a value;
+            # step over it so the value behind it is what gets read.
+            end = self._text.find("]", self._pos)
+            if end == -1:
+                self._pos = self._len
+                return "none", ""
+            self._pos = end + 1
+        value = self._next_token()
+        return ("string", value) if value is not None else ("none", "")
+
+    def _next_token(self) -> Optional[str]:
+        """Read one token, or None once the file runs out."""
+        self._skip_ignored()
+        if self._pos >= self._len:
+            return None
+        if self._text[self._pos] == '"':
+            return self._read_string()
+        start = self._pos      # a bare word runs to the next space or quote
+        while (self._pos < self._len
+               and self._text[self._pos] not in _ACF_WHITESPACE + '"'):
+            self._pos += 1
+        return self._text[start:self._pos]
+
+    def _skip_ignored(self) -> None:
+        """Advance past whitespace and // line comments."""
+        while self._pos < self._len:
+            if self._text[self._pos] in _ACF_WHITESPACE:
+                self._pos += 1
+            elif self._text.startswith("//", self._pos):
+                end = self._text.find("\n", self._pos)
+                self._pos = self._len if end == -1 else end + 1
+            else:
+                return
+
+    def _read_string(self) -> Optional[str]:
+        """Read the quoted string starting at the current (opening) quote.
+        An unterminated one consumes the rest of the file rather than
+        looping, so a truncated manifest can't spin here."""
+        text = self._text
+        if text.startswith('"""', self._pos):
+            end = text.find('"""', self._pos + 3)     # multi-line: literal, no escapes
+            if end == -1:
+                self._pos = self._len
+                return None
+            value = text[self._pos + 3:end]
+            self._pos = end + 3
+            return value
+        out = []
+        index = self._pos + 1
+        while index < self._len:
+            char = text[index]
+            if char == '"':
+                self._pos = index + 1
+                return "".join(out)
+            if char == "\\" and index + 1 < self._len:
+                out.append(_ACF_ESCAPES.get(text[index + 1], text[index + 1]))
+                index += 2
+                continue
+            out.append(char)
+            index += 1
+        self._pos = self._len
+        return None
+
+    def _skip_block(self) -> None:
+        """Skip the rest of a block whose '{' has already been consumed.
+        Strings are skipped whole so a brace inside a value can't shift the
+        nesting count and hide everything after it."""
+        depth = 1
+        while self._pos < self._len:
+            char = self._text[self._pos]
+            if char == '"':
+                self._read_string()
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    self._pos += 1
+                    return
+            self._pos += 1
+
+
+def _read_acf_app_name(entry) -> Optional[str]:
+    """The app name in one appmanifest file, or None when it doesn't resolve
+    to one: unreadable, bigger than any manifest Steam writes, not valid
+    KeyValues, or carrying no name field."""
+    try:
+        with open(entry.path, "rb") as handle:
+            # The extra byte is what tells "exactly at the cap" apart from
+            # "overflows it" without stat()ing first and racing the read.
+            raw = handle.read(_ACF_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _ACF_MAX_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8-sig")       # what Steam writes; drops a BOM
+    except UnicodeDecodeError:
+        # Not UTF-8, so this is an older manifest written in the game's own
+        # Windows codepage. Silently dropping those bytes is how "Café Noir"
+        # used to come back as "Caf Noir"; cp1252 can at least show them.
+        text = raw.decode("cp1252", errors="replace")
+    return _AcfParser(text).app_name()
+
+
 def _read_steam_app_names(steam_root: str) -> dict:
     """Reads local appmanifest_<id>.acf files (plain text, no network
-    access) to resolve a Steam AppID to its real game name where possible."""
+    access) to resolve a Steam AppID to its real game name where possible.
+
+    A manifest that doesn't yield a name is simply left out (see
+    _read_acf_app_name): callers treat a missing name as "not a game", so a
+    guess here would surface a wrong name rather than a missing one."""
     names = {}
     steamapps = os.path.join(steam_root, "steamapps")
     try:
@@ -795,14 +1007,9 @@ def _read_steam_app_names(steam_root: str) -> dict:
                     and entry.name.endswith(".acf")):
                 continue
             appid = entry.name[len("appmanifest_"):-len(".acf")]
-            try:
-                with open(entry.path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                match = re.search(r'"name"\s*"([^"]+)"', content)
-                if match:
-                    names[appid] = match.group(1)
-            except OSError:
-                continue
+            name = _read_acf_app_name(entry)
+            if name:
+                names[appid] = name
     return names
 
 
