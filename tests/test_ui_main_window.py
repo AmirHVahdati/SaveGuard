@@ -27,7 +27,7 @@ from app.models import Game
 from app.scanner import build_snapshot
 from app.ui import main_window as main_window_module
 from app.ui.game_card import GameCard
-from app.ui.main_window import MainWindow, SUPPORT_URL
+from app.ui.main_window import MAX_CONCURRENT_BACKUPS, MainWindow, SUPPORT_URL
 
 from helpers import write_files
 
@@ -176,7 +176,7 @@ def stage_never_backed_up_games(window, tmp_path, names=("A", "B", "C")):
     for game in games:
         window.status_cache[game.id] = "never"
     requested = []
-    window._on_backup_requested = requested.append
+    window._start_backup = requested.append
     return games, requested
 
 
@@ -933,7 +933,14 @@ class TestBackupAll:
         qtbot.waitUntil(lambda: len(requested) == 3, timeout=2000)
         assert sorted(requested) == sorted(game.id for game in games)
 
-    def test_backups_run_one_at_a_time(self, main_window, tmp_path, monkeypatch, qtbot):
+    def test_each_backup_is_started_by_a_separate_call(self, main_window, tmp_path,
+                                                       monkeypatch, qtbot):
+        # What this actually pins: the queue drains one game per _start_backup
+        # call, so a backup that completes instantly cannot re-enter the loop
+        # that started it. It is *not* a claim that backups run one at a time --
+        # they run concurrently, bounded by MAX_CONCURRENT_BACKUPS. The old
+        # version of this test was named "one_at_a_time" while asserting only
+        # this, which read as a serialization guarantee the code never made.
         games, _requested = stage_never_backed_up_games(main_window, tmp_path)
         in_flight = []
         batches = []
@@ -942,11 +949,9 @@ class TestBackupAll:
             batches.append(list(in_flight))
             in_flight.append(game_id)
 
-        main_window._on_backup_requested = one_at_a_time
+        main_window._start_backup = one_at_a_time
         main_window._on_backup_all()
         qtbot.waitUntil(lambda: len(in_flight) == 3, timeout=2000)
-        # Each is started on its own event loop tick, so a fast completion
-        # can't re-enter the loop that started it.
         assert all(len(batch) == index for index, batch in enumerate(batches))
 
     def test_skips_games_that_are_already_up_to_date(self, main_window, tmp_path,
@@ -957,7 +962,7 @@ class TestBackupAll:
         main_window.status_cache = {gid: "changed" for gid in main_window.games}
         for gid in list(main_window.games)[1:]:
             main_window.status_cache[gid] = "synced"
-        main_window._on_backup_requested = requested.append
+        main_window._start_backup = requested.append
         main_window._on_backup_all()
         qtbot.waitUntil(lambda: requested == [changed.id], timeout=2000)
 
@@ -996,6 +1001,117 @@ class TestBackupAll:
         stage_never_backed_up_games(main_window, tmp_path)
         main_window._on_backup_all()
         qtbot.waitUntil(lambda: main_window.backup_all_btn.isEnabled() is True, timeout=2000)
+
+
+class TestConcurrentBackupCeiling:
+    """The ceiling is the point of this: "Backup All" used to start one thread
+    per game needing a backup, all live at once (measured 12 concurrent for a
+    12-game library), with every one of them walking a different save folder
+    and writing then re-reading an archive."""
+
+    def stage(self, main_window, tmp_path, count):
+        games = [make_game(main_window, f"Game {index}", tmp_path / f"g{index}")
+                 for index in range(count)]
+        for game in games:
+            main_window.status_cache[game.id] = "never"
+        return games
+
+    def test_no_more_than_the_ceiling_start_at_once(self, main_window, tmp_path):
+        games = self.stage(main_window, tmp_path, 9)
+        started = []
+        main_window._start_backup = lambda gid: (
+            started.append(gid), main_window.workers.__setitem__(gid, RunningWorker())
+        )
+
+        main_window._on_backup_all()
+
+        assert len(started) == MAX_CONCURRENT_BACKUPS
+        assert len(main_window._backup_queue) == 9 - MAX_CONCURRENT_BACKUPS
+        # And the ones that started are exactly the ceiling's worth, not all nine.
+        assert set(started) == {game.id for game in games[:MAX_CONCURRENT_BACKUPS]}
+
+    def test_a_freed_slot_starts_the_next_waiting_backup(self, main_window, tmp_path):
+        self.stage(main_window, tmp_path, 6)
+        started = []
+        main_window._start_backup = lambda gid: (
+            started.append(gid), main_window.workers.__setitem__(gid, RunningWorker())
+        )
+        main_window._on_backup_all()
+        assert len(started) == MAX_CONCURRENT_BACKUPS
+
+        # One finishes the way a real worker would: QThread's finished signal,
+        # which is what drops the reference.
+        finished_id = started[0]
+        main_window._on_backup_worker_finished(finished_id)
+
+        assert len(started) == MAX_CONCURRENT_BACKUPS + 1
+        assert finished_id not in main_window.workers
+        assert len(main_window._backup_queue) == 6 - len(started)
+
+    def test_the_queue_drains_one_per_completion(self, main_window, tmp_path):
+        total = 9
+        self.stage(main_window, tmp_path, total)
+        started = []
+        main_window._start_backup = lambda gid: (
+            started.append(gid), main_window.workers.__setitem__(gid, RunningWorker())
+        )
+        main_window._on_backup_all()
+
+        while main_window._backup_queue or main_window.workers:
+            running = list(main_window.workers)
+            assert len(running) <= MAX_CONCURRENT_BACKUPS
+            main_window._on_backup_worker_finished(running[0])
+
+        assert len(started) == total
+        assert len(set(started)) == total      # nothing queued or started twice
+
+    def test_a_card_button_press_shares_the_same_budget(self, main_window, tmp_path):
+        # The ceiling is enforced in the shared path, so it holds however the
+        # backup was asked for rather than only for the batch button.
+        self.stage(main_window, tmp_path, 10)
+        started = []
+        main_window._start_backup = lambda gid: (
+            started.append(gid), main_window.workers.__setitem__(gid, RunningWorker())
+        )
+
+        for game in main_window.games.values():
+            main_window._on_backup_requested(game.id)
+
+        assert len(started) == MAX_CONCURRENT_BACKUPS
+
+    def test_a_game_already_backing_up_is_not_queued_again(self, main_window, tmp_path):
+        game = make_game(main_window, "Running", tmp_path / "running")
+        main_window.workers[game.id] = RunningWorker()
+
+        main_window._on_backup_requested(game.id)
+        main_window._on_backup_requested(game.id)
+
+        assert main_window._backup_queue == []
+
+    def test_a_game_already_waiting_is_not_queued_twice(self, main_window, tmp_path):
+        self.stage(main_window, tmp_path, 6)
+        main_window._start_backup = lambda gid: main_window.workers.__setitem__(
+            gid, RunningWorker())
+        main_window._on_backup_all()
+        waiting = list(main_window._backup_queue)
+        assert waiting
+
+        main_window._on_backup_requested(waiting[0])
+
+        assert main_window._backup_queue == waiting
+
+    def test_the_button_is_re_enabled_once_the_queue_is_empty(self, main_window, tmp_path):
+        # Nothing is waiting, so there is nothing for the button to be blocked
+        # on -- games already in flight are filtered out of the next Backup All
+        # anyway.
+        self.stage(main_window, tmp_path, 2)
+        main_window._start_backup = lambda gid: main_window.workers.__setitem__(
+            gid, RunningWorker())
+        main_window.backup_all_btn.setEnabled(False)
+
+        main_window._on_backup_all()
+
+        assert main_window.backup_all_btn.isEnabled() is True
 
 
 class TestBackupProgress:

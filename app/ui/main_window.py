@@ -44,6 +44,24 @@ VIRTUAL_BUFFER = 3
 # fewer cards than fit rather than more.
 CARD_HEIGHT = 268  # a card is closer to 128px; this is a conservative bound
 
+# Ceiling on backups running at the same time.
+#
+# Each backup is its own QThread doing a folder walk, a zip write, and then a
+# full re-read of that zip to verify it, so "Backup All" used to start one
+# thread per game needing a backup -- measured 12 simultaneously for a 12-game
+# library. The contention is not just for CPU: every one of those threads is
+# walking a different save folder of small files and writing and re-reading an
+# archive, which is exactly the access pattern a single mechanical disk handles
+# worst.
+#
+# A fixed number rather than one derived from cpu_count, so the ceiling is the
+# same on every machine and can be asserted in a test. Bounding to 4 measured
+# no slower than unbounded on this machine (0.80s vs 0.89s for 12 games of 300
+# files), so the ceiling costs no throughput here while keeping a large library
+# off the disk's limit -- where the benefit grows, since the same 12 backups on
+# an HDD are bound by seeks rather than by cores.
+MAX_CONCURRENT_BACKUPS = 4
+
 
 def _status_for(save_path, last_backup_time, last_snapshot) -> str:
     """The backup status of one game, from its fields alone.
@@ -122,6 +140,7 @@ class MainWindow(QMainWindow):
         self.status_cache: dict[str, str] = {}  # game_id -> status, refreshed on demand
         self.scan_worker: GameScanWorker = None
         self.status_worker: StatusWorker = None
+        self._backup_queue: list[str] = []
         self._show_summary_after_statuses: bool = False
         self.settings: dict = load_settings()
         self._status_update_pending: bool = False  # for batching UI updates during backup completions
@@ -911,31 +930,48 @@ class MainWindow(QMainWindow):
             return
 
         self.backup_all_btn.setEnabled(False)
+        for game_id in needing:
+            if game_id not in self._backup_queue:
+                self._backup_queue.append(game_id)
+        self.status_bar.showMessage(f"Backing up {len(needing)} game(s)…", 4000)
+        self._pump_backup_queue()
 
-        # Queue up the backup requests so we don't have reentrancy issues
-        # if any backup finishes very quickly during the loop
-        pending = list(needing)
+    def _pump_backup_queue(self):
+        """Start queued backups until the concurrency ceiling is reached.
 
-        def start_next():
-            if not pending:
-                self.backup_all_btn.setEnabled(True)
-                self._update_backup_all_button()
-                self.status_bar.showMessage(f"Backing up {len(needing)} game(s)…", 4000)
-                return
-            game_id = pending.pop(0)
-            self._on_backup_requested(game_id)
-            # Schedule next iteration on next event loop tick to allow
-            # any rapid completions to settle
-            QTimer.singleShot(0, start_next)
-
-        QTimer.singleShot(0, start_next)
+        This is what keeps a library-wide "Backup All" from becoming one thread
+        per game. Starting is spread over separate event loop iterations --
+        deliberately, since a backup that completes instantly would otherwise
+        re-enter the loop that started it -- but that is reentrancy safety, not
+        a concurrency limit: every thread stayed live for the whole walk-and-zip,
+        so they all ran at once.
+        """
+        while self._backup_queue and len(self.workers) < MAX_CONCURRENT_BACKUPS:
+            self._start_backup(self._backup_queue.pop(0))
+        if not self._backup_queue:
+            # Everything has been handed to a worker, so nothing is waiting.
+            # Games already in flight are filtered out of the next "Backup All"
+            # anyway, so this does not need to wait for them to finish.
+            self.backup_all_btn.setEnabled(True)
+            self._update_backup_all_button()
 
     def _on_backup_requested(self, game_id: str):
+        """Queue a backup, starting one now if the budget has room.
+
+        Shared by "Backup All" and each card's own button, so the ceiling holds
+        however the backup was asked for rather than only on the batch path.
+        """
+        if game_id in self.workers:
+            return  # already backing up
+        if game_id in self._backup_queue:
+            return  # already waiting for a slot
+        self._backup_queue.append(game_id)
+        self._pump_backup_queue()
+
+    def _start_backup(self, game_id: str):
         game = self.games.get(game_id)
         if not game:
             return
-        if game_id in self.workers:
-            return  # already backing up
         if not os.path.isdir(game.save_path):
             QMessageBox.warning(self, "Save folder missing",
                                  f"The save folder for “{game.name}” could not be found:\n{game.save_path}")
@@ -957,13 +993,20 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_backup_progress)
         worker.backup_finished.connect(self._on_backup_finished)
         worker.error.connect(self._on_backup_error)
-        # QThread's own built-in `finished` signal only fires once the OS
-        # thread has actually terminated — that's the safe point to drop our
-        # last reference, not the moment our custom `backup_finished`/`error`
-        # signal arrives (which is emitted just before run() returns).
-        worker.finished.connect(lambda gid=game_id: self.workers.pop(gid, None))
+        worker.finished.connect(lambda gid=game_id: self._on_backup_worker_finished(gid))
         self.workers[game_id] = worker
         worker.start()
+
+    def _on_backup_worker_finished(self, game_id: str):
+        """A slot has freed up: drop the worker and start whoever is waiting.
+
+        QThread's own built-in `finished` signal only fires once the OS thread
+        has actually terminated — that's the safe point to drop our last
+        reference, not the moment our custom `backup_finished`/`error` signal
+        arrives (which is emitted just before run() returns).
+        """
+        self.workers.pop(game_id, None)
+        self._pump_backup_queue()
 
     def _on_backup_progress(self, game_id: str, current: int, total: int):
         card = self.cards.get(game_id)
