@@ -8,6 +8,7 @@ more than once per game per user action (see _recompute_statuses).
 """
 
 import os
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, QEvent, QThread, Signal
 from PySide6.QtGui import QDesktopServices
@@ -722,10 +723,55 @@ class MainWindow(QMainWindow):
 
     # ---------------- add / edit / remove ----------------
 
+    def _game_using_folder(self, save_path: str, exclude_id: Optional[str] = None):
+        """The tracked game already pointed at this save folder, if any.
+
+        Compared by resolved folder identity rather than by text, because that
+        is what the rest of the app compares: paths_conflict and the backup
+        containment check both go through path_key, so a folder reached through
+        a junction is already "the same directory" as far as backups are
+        concerned. Text comparison would miss a duplicate precisely in the
+        layout that produces the worst one.
+        """
+        key = comparable_path_key(save_path)
+        for game in self.games.values():
+            if game.id != exclude_id and comparable_path_key(game.save_path) == key:
+                return game
+        return None
+
+    def _confirm_duplicate_folder(self, save_path: str, exclude_id: Optional[str] = None) -> bool:
+        """True if this save folder may be used — asking first when another game
+        already points at it.
+
+        Warned rather than refused because the duplicate is occasionally what
+        the user wants (one folder deliberately tracked under a second name),
+        and refusing or silently merging it would take that decision away from
+        them. Defaulted to No, since what is being warned about is two games
+        over one folder: each keeps its own backup history, the two can drift
+        apart, and restoring one silently ignores the other.
+        """
+        other = self._game_using_folder(save_path, exclude_id)
+        if other is None:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Save folder already tracked",
+            f"“{other.name}” already points at this folder:\n\n"
+            f"{save_path}\n\n"
+            f"Tracking it as a second game keeps two separate backup histories "
+            f"of the same saves, which can drift apart — restoring one will "
+            f"not bring back the other. Add it anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def _on_add_game(self):
         dialog = AddGameDialog(self)
         if dialog.exec():
             data = dialog.result_data
+            if not self._confirm_duplicate_folder(data["save_path"]):
+                return
             game = Game.new(data["name"], data["save_path"], data["backup_root"])
             self.games[game.id] = game
             self._persist()
@@ -740,6 +786,13 @@ class MainWindow(QMainWindow):
         dialog = AddGameDialog(self, existing=game)
         if dialog.exec():
             data = dialog.result_data
+            # Asked on edit too, or the guard above is one dialog away from
+            # being bypassed: moving a game onto another game's folder is the
+            # same duplicate, reached by typing rather than by scanning. The
+            # game being edited never conflicts with itself, so re-saving the
+            # dialog without touching the folder stays silent.
+            if not self._confirm_duplicate_folder(data["save_path"], exclude_id=game.id):
+                return
             old_name = game.name  # for detecting if card needs repositioning
             game.name = data["name"]
             game.save_path = data["save_path"]

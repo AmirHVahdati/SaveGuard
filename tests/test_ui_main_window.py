@@ -673,8 +673,10 @@ class TestEditGame:
         assert config.load_games()[0]["name"] == "Hades II"
 
     def test_a_rename_repositions_the_card(
-            self, tracked, main_window, monkeypatch, save_root, backup_root):
-        make_game(main_window, "AAA Game", save_root)
+            self, tracked, main_window, monkeypatch, save_root, backup_root, tmp_path):
+        # Its own folder: sharing save_root with the tracked game would be a
+        # second game on one folder, which the add/edit guard now asks about.
+        make_game(main_window, "AAA Game", tmp_path / "aaa_saves")
         main_window._rebuild_cards()
         stub_dialog(monkeypatch, "AddGameDialog", result_data=new_game_data(
             save_root, backup_root, name="ZZZ Renamed"))
@@ -707,6 +709,178 @@ class TestEditGame:
             tmp_path / "gone", tmp_path / "backups"))
         main_window._on_edit_game(tracked.id)
         assert main_window.status_cache[tracked.id] == "invalid"
+
+
+class TestDuplicateSaveFolderWarning:
+    """Adding or editing a game onto a folder another game already has.
+
+    Warned about, not refused. Two games can share a save folder on purpose
+    (one folder deliberately tracked under a second name), so the choice is the
+    user's -- but left unmentioned it is also how a duplicate appears by
+    accident, with two backup histories over one folder that drift apart and a
+    restore that silently ignores whichever one was not chosen.
+    """
+
+    def fail_if_asked(self, monkeypatch):
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **k: pytest.fail("should not have asked about a duplicate"),
+        )
+
+    def answer(self, monkeypatch, reply):
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda parent, title, text, *a, **k: asked.append((title, text)) or reply,
+        )
+        return asked
+
+    # ---- adding ----
+
+    def test_adding_over_a_tracked_folder_asks_first(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        asked = self.answer(monkeypatch, QMessageBox.No)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades Again"))
+
+        main_window._on_add_game()
+
+        assert len(asked) == 1
+        assert tracked.id in main_window.games
+        assert [g.name for g in main_window.games.values()] == ["Hades"]
+
+    def test_declining_adds_nothing_at_all(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        self.answer(monkeypatch, QMessageBox.No)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades Again"))
+
+        main_window._on_add_game()
+
+        assert main_window.games == {tracked.id: tracked}
+        assert config.load_games() == []
+        assert card_order(main_window) == ["Hades"]
+
+    def test_confirming_adds_the_second_game(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        self.answer(monkeypatch, QMessageBox.Yes)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades Again"))
+
+        main_window._on_add_game()
+
+        assert sorted(g.name for g in main_window.games.values()) == [
+            "Hades", "Hades Again",
+        ]
+        assert len(config.load_games()) == 2
+
+    def test_a_genuinely_new_folder_is_added_without_asking(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        self.fail_if_asked(monkeypatch)
+        other = write_files(save_root.parent / "Celeste", {"slot.sav": "a"})
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(other, backup_root, name="Celeste"))
+
+        main_window._on_add_game()
+
+        assert sorted(g.name for g in main_window.games.values()) == [
+            "Celeste", "Hades",
+        ]
+
+    def test_the_warning_names_the_game_already_there(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        asked = self.answer(monkeypatch, QMessageBox.No)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades Again"))
+
+        main_window._on_add_game()
+
+        title, text = asked[0]
+        assert "already tracked" in title
+        assert "Hades" in text
+        assert str(save_root) in text
+
+    def test_asking_defaults_to_no(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        defaults = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda parent, title, text, buttons, default: (
+                defaults.append(default) or QMessageBox.No
+            ),
+        )
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades Again"))
+
+        main_window._on_add_game()
+
+        # Enter on a prompt about a duplicate must not create one.
+        assert defaults == [QMessageBox.No]
+
+    def test_a_link_to_a_tracked_folder_asks_too(
+            self, tracked, main_window, monkeypatch, save_root, backup_root,
+            tmp_path, junction):
+        asked = self.answer(monkeypatch, QMessageBox.No)
+        junction(save_root, "HadesLink", parent=tmp_path)
+        stub_dialog(monkeypatch, "AddGameDialog", result_data=new_game_data(
+            tmp_path / "HadesLink", backup_root, name="Hades Link"))
+
+        main_window._on_add_game()
+
+        assert len(asked) == 1
+        assert len(main_window.games) == 1
+
+    # ---- editing ----
+
+    def test_moving_a_game_onto_another_asks_first(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        other = write_files(save_root.parent / "Celeste", {"slot.sav": "a"})
+        celeste = make_game(main_window, "Celeste", other)
+        asked = self.answer(monkeypatch, QMessageBox.No)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(other, backup_root, name="Hades"))
+
+        main_window._on_edit_game(tracked.id)
+
+        assert len(asked) == 1
+        # Declined, so the move is not applied: the game keeps its own folder.
+        assert main_window.games[tracked.id].save_path == str(save_root)
+        assert main_window.games[celeste.id].save_path == str(other)
+
+    def test_confirming_the_move_applies_it(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        other = write_files(save_root.parent / "Celeste", {"slot.sav": "a"})
+        make_game(main_window, "Celeste", other)
+        self.answer(monkeypatch, QMessageBox.Yes)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(other, backup_root, name="Hades"))
+
+        main_window._on_edit_game(tracked.id)
+
+        assert main_window.games[tracked.id].save_path == str(other)
+
+    def test_re_saving_the_same_folder_does_not_ask(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        # The game being edited never conflicts with itself, so an ordinary
+        # rename or backup-folder change stays silent.
+        self.fail_if_asked(monkeypatch)
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades II"))
+
+        main_window._on_edit_game(tracked.id)
+
+        assert main_window.games[tracked.id].name == "Hades II"
+
+    def test_a_rename_is_not_treated_as_a_duplicate_name(
+            self, tracked, main_window, monkeypatch, save_root, backup_root):
+        self.fail_if_asked(monkeypatch)
+        make_game(main_window, "Hades II", save_root.parent / "hades2")
+        stub_dialog(monkeypatch, "AddGameDialog",
+                    result_data=new_game_data(save_root, backup_root, name="Hades II"))
+
+        main_window._on_edit_game(tracked.id)
+
+        assert main_window.games[tracked.id].name == "Hades II"
 
 
 class TestRemoveGame:
