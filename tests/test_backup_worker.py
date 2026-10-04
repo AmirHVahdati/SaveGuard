@@ -605,6 +605,167 @@ class TestFailedBackup:
         assert "No space left" in result.errors.last[1]
 
 
+class TestIncompleteArchiveCleanup:
+    """Which archive a failure is allowed to delete.
+
+    The archive file exists from the moment ZipFile opens it, so its presence
+    on disk says nothing about whether it holds the saves. Two things follow,
+    and both went wrong: a failure after the archive verified used to delete a
+    complete backup, while an interruption that skipped the Exception handler
+    left a half-written one that opens cleanly and reads back as valid.
+    """
+
+    def _fail_after_the_write(self, monkeypatch, where):
+        """Patch a stage that only runs once the archive is complete."""
+        import app.backup_worker as worker_module
+
+        if where == "prune":
+            def boom(self):
+                raise OSError("simulated prune failure")
+            monkeypatch.setattr(worker_module.BackupWorker,
+                                "_prune_old_backups", boom)
+        else:
+            def boom(path):
+                raise OSError("simulated snapshot failure")
+            monkeypatch.setattr(worker_module, "build_snapshot", boom)
+
+    @pytest.mark.parametrize("where", ["prune", "snapshot"])
+    def test_a_failure_after_verification_keeps_the_finished_archive(
+            self, save_root, backup_root, run_backup, monkeypatch, where):
+        self._fail_after_the_write(monkeypatch, where)
+        result = run_backup(save_root, backup_root)
+
+        assert not result.finished, "the failure is still reported"
+        archives = list(backup_root.glob("*.zip"))
+        # The saves are safely archived at this point; only the housekeeping
+        # after that failed, so the backup must survive it.
+        assert len(archives) == 1
+        with zipfile.ZipFile(archives[0]) as zf:
+            assert sorted(zf.namelist()) == [
+                "SaveData/nested.sav", "settings.ini", "slot1.sav",
+            ]
+
+    def test_a_prune_failure_keeps_the_earlier_archives(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        self._fail_after_the_write(monkeypatch, "prune")
+        seed_backups(backup_root, 3)
+        run_backup(save_root, backup_root, max_backups=1)
+
+        # Pruning is what failed, so nothing was deleted at all -- and the new,
+        # verified archive is still there besides.
+        assert len(backup_names(backup_root)) == 4  # 3 seeded + the new one
+
+    def test_a_snapshot_failure_still_prunes_as_configured(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        # Retention runs *before* the fingerprint, so by the time this fails it
+        # has already run -- legitimately, since the new archive had verified by
+        # then. What must not happen is the failure handler treating that
+        # finished archive as a casualty on top of it.
+        self._fail_after_the_write(monkeypatch, "snapshot")
+        seed_backups(backup_root, 3)
+        run_backup(save_root, backup_root, max_backups=1)
+
+        assert len(backup_names(backup_root)) == 1
+
+    def test_an_interrupted_write_leaves_no_archive(self, save_root, backup_root,
+                                                     run_backup, monkeypatch):
+        # KeyboardInterrupt is a BaseException, so it skips an
+        # `except Exception` handler entirely. zipfile still closes the file on
+        # the way out, so what it leaves behind opens cleanly with only the
+        # files written before the interruption -- a plausible-looking backup
+        # holding a fraction of the saves.
+        import app.backup_worker as worker_module
+
+        class InterruptingZip(worker_module.zipfile.ZipFile):
+            calls = 0
+
+            def write(self, *args, **kwargs):
+                InterruptingZip.calls += 1
+                if InterruptingZip.calls == 2:
+                    raise KeyboardInterrupt("simulated Ctrl-C")
+                return super().write(*args, **kwargs)
+
+        monkeypatch.setattr(worker_module.zipfile, "ZipFile", InterruptingZip)
+        worker = BackupWorker("game-1", "Test Game", str(save_root), str(backup_root))
+        errors = []
+        worker.error.connect(lambda *args: errors.append(args))
+
+        with pytest.raises(KeyboardInterrupt):
+            worker.run()
+
+        assert errors == [], "an interruption is not a backup error to report"
+        assert list(backup_root.glob("*.zip")) == []
+
+    def test_an_interrupted_write_is_still_reported_to_whoever_raised_it(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        # The cleanup must not swallow the interruption: a caller that cancels
+        # a backup needs to see that the cancellation actually happened.
+        import app.backup_worker as worker_module
+
+        class InterruptingZip(worker_module.zipfile.ZipFile):
+            calls = 0
+
+            def write(self, *args, **kwargs):
+                InterruptingZip.calls += 1
+                if InterruptingZip.calls == 1:
+                    raise KeyboardInterrupt("simulated Ctrl-C")
+                return super().write(*args, **kwargs)
+
+        monkeypatch.setattr(worker_module.zipfile, "ZipFile", InterruptingZip)
+        worker = BackupWorker("game-1", "Test Game", str(save_root), str(backup_root))
+        with pytest.raises(KeyboardInterrupt):
+            worker.run()
+        assert list(backup_root.glob("*.zip")) == []
+
+    def test_a_failed_verification_still_deletes_the_archive(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        # The other side of the same coin: unproven is not proven-good, so an
+        # archive that failed verification is still removed.
+        import app.backup_worker as worker_module
+
+        def rejecting(zip_path, expected, name):
+            raise OSError(f"{name}: simulated corruption")
+
+        monkeypatch.setattr(worker_module, "_verify_backup_archive", rejecting)
+        result = run_backup(save_root, backup_root)
+
+        assert not result.finished
+        assert list(backup_root.glob("*.zip")) == []
+
+    def test_undeletable_incomplete_archive_does_not_mask_the_error(
+            self, save_root, backup_root, run_backup, monkeypatch):
+        # Best-effort by design: failing to delete the leftover must not become
+        # a second failure, and must not replace the error actually worth
+        # reporting. Here that means the partial file survives on disk -- the
+        # user is told what went wrong and nothing claims otherwise.
+        import app.backup_worker as worker_module
+
+        class FailingZip(worker_module.zipfile.ZipFile):
+            calls = 0
+
+            def write(self, *args, **kwargs):
+                FailingZip.calls += 1
+                if FailingZip.calls == 2:
+                    raise OSError("simulated write failure")
+                return super().write(*args, **kwargs)
+
+        monkeypatch.setattr(worker_module.zipfile, "ZipFile", FailingZip)
+        real_remove = worker_module.os.remove
+
+        def refusing_remove(path, *args, **kwargs):
+            if str(path).endswith(".zip"):
+                raise PermissionError("file is open elsewhere")
+            return real_remove(path, *args, **kwargs)
+
+        monkeypatch.setattr(worker_module.os, "remove", refusing_remove)
+        result = run_backup(save_root, backup_root)
+
+        assert not result.finished
+        assert "simulated write failure" in result.errors.last[1]
+        assert len(result.errors) == 1
+        assert len(list(backup_root.glob("*.zip"))) == 1
+
+
 # ---------------------------------------------------------------------------
 # folders the walk could not reach
 # ---------------------------------------------------------------------------

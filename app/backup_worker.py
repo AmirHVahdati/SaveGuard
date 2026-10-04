@@ -19,7 +19,7 @@ import os
 import re
 import zipfile
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from PySide6.QtCore import QThread, Signal
 
@@ -285,6 +285,11 @@ class BackupWorker(QThread):
 
     def run(self):
         zip_path = None
+        # Flipped once the archive has been written AND verified, so the failure
+        # handler can tell a half-written archive from a complete one. Both
+        # halves matter: the file exists from the moment ZipFile opens it, so
+        # its mere existence says nothing about whether it holds the saves.
+        archive_verified = False
         try:
             if not os.path.isdir(self.save_path):
                 self.error.emit(self.game_id, "The save folder path no longer exists.")
@@ -425,6 +430,7 @@ class BackupWorker(QThread):
             # archive verifies, so a bad backup leaves the previous ones
             # exactly as they were.
             _verify_backup_archive(zip_path, arcnames, self.game_name)
+            archive_verified = True
 
             backups_remaining = self._prune_old_backups()
 
@@ -433,14 +439,43 @@ class BackupWorker(QThread):
             new_snapshot = build_snapshot(self.save_path)
             self.backup_finished.emit(self.game_id, new_snapshot, timestamp, zip_path, backups_remaining)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
-            # Clean up a partially-written archive so it doesn't look like a
-            # valid backup.
-            if zip_path and os.path.exists(zip_path):
-                try:
-                    os.remove(zip_path)
-                except OSError:
-                    pass
+            self._discard_incomplete_archive(zip_path, archive_verified)
             self.error.emit(self.game_id, str(exc))
+        except BaseException:
+            # Ctrl-C or an interpreter shutdown landing mid-write. Not ours to
+            # report as a backup error -- it isn't the backup's fault and the
+            # caller still needs to see it -- but the half-written archive does
+            # have to go. zipfile closes the file on its way out of the with
+            # block, so what survives an interrupted write is not a corrupt
+            # file: it opens cleanly and reads back as a valid archive holding
+            # only the files written before the interruption. Left in place,
+            # that is worse than nothing -- it counts as one of this game's
+            # backups, and the next retention pass can spend a good older
+            # archive making room for it.
+            self._discard_incomplete_archive(zip_path, archive_verified)
+            raise
+
+    @staticmethod
+    def _discard_incomplete_archive(zip_path: Optional[str], verified: bool) -> None:
+        """Delete the archive of a backup that did not complete, so a
+        half-written one can't pass for a backup.
+
+        Skipped once the archive has verified: from that point on it is a
+        complete backup, and a later failure -- pruning old ones, or
+        fingerprinting the save folder -- has no business destroying it. The
+        saves are safely archived at that moment, so deleting the file trades
+        a recoverable failure (the backup succeeded; only housekeeping failed)
+        for an unrecoverable one.
+
+        Best-effort by design: an archive held open by something else, or on a
+        drive that has gone away, must not turn one reported failure into two.
+        """
+        if verified or not zip_path or not os.path.exists(zip_path):
+            return
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
 
     def _prune_old_backups(self) -> int:
         """Deletes the oldest backups beyond self.max_backups, if a limit is
