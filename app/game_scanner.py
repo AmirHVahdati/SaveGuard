@@ -30,13 +30,18 @@ places, native Linux install, Flatpak, and Snap included):
                                                 real name resolves from a
                                                 local appmanifest, otherwise
                                                 skipped entirely — see below)
-  - .../steamapps/compatdata/<AppID>/pfx/drive_c/users/steamuser/...
+  - .../steamapps/compatdata/<AppID>/pfx/drive_*/users/<user>/...
     Proton runs every Windows game inside a private Wine prefix that mirrors
     a real Windows user folder — so a Windows game played through Proton on
     Linux gets the exact same Documents\\My Games / Saved Games / AppData
-    heuristics as native Windows, just rooted inside that prefix. Only
-    surfaced when the AppID resolves to a real name (same policy as native
-    Steam entries below), labeled "Proton" so the source is clear.
+    heuristics as native Windows, just rooted inside the prefix. The prefix,
+    the drive and the account folder are located by structure rather than
+    assumed (Proton's own layout is pfx/drive_c/users/steamuser, but those
+    names belong to whichever tool built the prefix, and a shared or
+    relocated prefix need not match them), and every user folder and every
+    folder inside a save location is searched. Only surfaced when the AppID
+    resolves to a real name (same policy as native Steam entries below),
+    labeled "Proton" so the source is clear.
 
 On Steam AppID naming: userdata contains numeric folders for things besides
 games too (Steam's own internal client components, e.g. AppID 5 and 7 are
@@ -638,13 +643,20 @@ def _resolve_game_folders(path: str, max_depth: int = 2, _depth: int = 1) -> Lis
         return resolved
 
 
-def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
-    """For 'My Games' / 'Saved Games' style roots: every direct subfolder is
-    normally one game, at high confidence — these locations are, by Windows
-    convention, only ever used for per-game save folders. Handles the
-    publisher-name nesting some games use via _resolve_game_folders, so the
-    candidate is always named after the actual game, not its publisher."""
-    results = []
+def _flat_style_candidates(root: str) -> List[Tuple[str, str]]:
+    """Every direct child of a 'My Games' / 'Saved Games' style root, resolved
+    to the folder that actually holds a game's saves.
+
+    Returns (name, save path) pairs. The name is the child's own folder name,
+    except for a publisher folder, where it's the resolved leaf's name so a
+    game is labelled by the game rather than by its studio.
+
+    Every child is resolved, not just the first one listed: a publisher folder
+    grouping two of a studio's games, or two publishers sitting side by side,
+    used to yield only whichever child the filesystem happened to return first
+    and to lose the rest.
+    """
+    found = []
     for sub in _list_subdirs(root):
         if os.path.basename(sub).lower() in _NON_GAME_FLAT_FOLDERS:
             continue
@@ -654,11 +666,21 @@ def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
             # For publisher folders, the resolved path goes deeper into a
             # game subfolder — use that folder's name, not the publisher's.
             name = os.path.basename(resolved_path) if is_publisher else sub_name
-            results.append(ScanCandidate(
-                name=name, save_path=resolved_path,
-                source=source_label, confidence="high",
-            ))
-    return results
+            found.append((name, resolved_path))
+    return found
+
+
+def scan_flat_style(root: str, source_label: str) -> List[ScanCandidate]:
+    """For 'My Games' / 'Saved Games' style roots: every direct subfolder is
+    normally one game, at high confidence — these locations are, by Windows
+    convention, only ever used for per-game save folders. Handles the
+    publisher-name nesting some games use via _resolve_game_folders, so the
+    candidate is always named after the actual game, not its publisher."""
+    return [
+        ScanCandidate(name=name, save_path=save_path,
+                      source=source_label, confidence="high")
+        for name, save_path in _flat_style_candidates(root)
+    ]
 
 
 def _get_documents_paths(home: str) -> List[str]:
@@ -1050,16 +1072,144 @@ def scan_steam_userdata(steam_root: str) -> List[ScanCandidate]:
     return results
 
 
+# Wine's built-in/shared account folders inside a prefix. They're real
+# directories rather than nobody's personal folder, so they never hold a
+# game's saves.
+_PROTON_NON_USER_DIRS = {"public", "default", "default user", "all users"}
+
+
+def _looks_like_proton_prefix(path: str) -> bool:
+    """True if this directory holds at least one Wine drive_<letter> directory,
+    which is what distinguishes a prefix from the tracked_files/ and log files
+    that sit beside one."""
+    return any(os.path.basename(drive).lower().startswith("drive_")
+               for drive in _list_subdirs(path))
+
+
+def _proton_prefix_roots(appid_dir: str) -> List[str]:
+    """Every Wine prefix directory belonging to one AppID.
+
+    Proton uses compatdata/<AppID>/pfx/, which is what nearly every prefix on
+    disk uses -- but "pfx" is only a directory name, and a setup that shares a
+    prefix between Proton builds, or relocates it, has no reason to keep it.
+    Rather than guessing names, a directory qualifies as a prefix by what it
+    contains, so pfx/, wine/ and anything else a tool chose are all found, and
+    the other entries in compatdata/<AppID>/ are ignored.
+
+    Subdirectories are listed following symlinks, unlike _list_subdirs: a
+    prefix moved to another disk is very often symlinked into place, and
+    skipping it would drop a game a scan previously found.
+    """
+    roots = [appid_dir] if _looks_like_proton_prefix(appid_dir) else []
+    try:
+        with os.scandir(appid_dir) as entries:
+            for entry in entries:
+                if _entry_is_dir(entry, follow_symlinks=True) \
+                        and _looks_like_proton_prefix(entry.path):
+                    roots.append(entry.path)
+    except OSError:
+        # An unreadable compatdata/<AppID> just means no prefix to read here;
+        # whatever was found before the failure is still worth returning.
+        pass
+    return roots
+
+
+def _proton_user_roots(prefix_root: str) -> List[str]:
+    """Every Windows user folder inside a Wine prefix.
+
+    Proton creates an account named "steamuser", but that's a Wine-side
+    detail rather than part of the layout Steam guarantees, and anything else
+    that creates a prefix names the folder after whoever made it. So instead
+    of hardcoding drive_c/users/steamuser, read the user folder under every
+    drive in the prefix and skip the shared ones -- "Public" is not a person.
+
+    Only drive_<letter> directories are read, never dosdevices/<letter>: those
+    are symlinks pointing back at the same drive, so reading both would
+    surface one save folder twice under two different paths.
+
+    No account is preferred over another: nearly every prefix has exactly one
+    (Proton's own steamuser), and reading all of them costs nothing where
+    there is one while keeping the saves of a prefix a third-party tool set
+    up with two.
+    """
+    roots = []
+    for drive in _list_subdirs(prefix_root):
+        if not os.path.basename(drive).lower().startswith("drive_"):
+            continue
+        for user in _list_subdirs(os.path.join(drive, "users")):
+            if os.path.basename(user).lower() in _PROTON_NON_USER_DIRS:
+                continue
+            roots.append(user)
+    return sorted(roots)
+
+
+def _proton_paths_of_kind(kind: str, user_root: str) -> List[str]:
+    """Save folders of one kind ("my_games", "saved_games", "documents" or
+    "appdata") inside one emulated Windows user folder."""
+    if kind in ("my_games", "saved_games"):
+        # Same resolution as a real Windows install, including the extra
+        # publisher-nesting layer -- and every child, not just the first.
+        root = os.path.join(user_root, "Documents", "My Games") \
+            if kind == "my_games" else os.path.join(user_root, "Saved Games")
+        found = [path for _, path in _flat_style_candidates(root)]
+    elif kind == "documents":
+        # A plain Documents folder, which is where a game ignoring the My Games
+        # convention keeps its saves.
+        found = [sub for sub in _list_subdirs(os.path.join(user_root, "Documents"))
+                 if os.path.basename(sub).lower() not in _DOCUMENTS_EXCLUDE]
+    else:
+        # AppData is too noisy to read blindly: only a folder that has a
+        # nested save-related folder counts, exactly as scan_appdata_style.
+        found = []
+        for sub in _list_subdirs(os.path.join(user_root, "AppData", "Local")):
+            if os.path.basename(sub).lower() in _APPDATA_EXCLUDE:
+                continue
+            save_dir = _find_save_subfolder(sub)
+            if save_dir:
+                found.append(save_dir)
+    return [path for path in found if _has_any_files(path)]
+
+
+def _proton_save_paths(user_roots: List[str]) -> List[str]:
+    """Every save folder in a Proton prefix, taken from the first location
+    kind that has any.
+
+    The order matches the Windows scanners (My Games, then Saved Games, then
+    Documents, then AppData), and every user folder is searched at each step
+    rather than stopping at the first one that exists, so a prefix holding two
+    Wine accounts doesn't lose a save to whichever was listed first. Once a
+    kind yields something, only that kind is used: a game keeping saves in
+    both My Games and AppData is still one game, and offering the same name
+    twice over two paths helps nobody.
+    """
+    for kind in ("my_games", "saved_games", "documents", "appdata"):
+        found = []
+        for user_root in user_roots:
+            found.extend(_proton_paths_of_kind(kind, user_root))
+        if found:
+            return found
+    return []
+
+
 def scan_proton_prefixes(steam_root: str) -> List[ScanCandidate]:
-    """Proton (Steam Play) runs each Windows game in its own Wine prefix at
-    steamapps/compatdata/<AppID>/pfx/, which contains a full emulated
-    Windows user folder — C:\\users\\steamuser\\Documents, \\AppData, etc.
-    Since that's structurally identical to a real Windows install, the same
-    My Games / Saved Games / Documents / AppData heuristics apply, just
-    rooted inside the prefix. Every prefix belongs to exactly one AppID, so
-    (like native Steam userdata) results are only surfaced when the AppID
-    resolves to a real name, and labeled with that name rather than a raw
-    folder name for accuracy."""
+    """Proton (Steam Play) runs each Windows game in its own Wine prefix, which
+    mirrors a real Windows user folder — Documents, AppData, Saved Games and
+    so on. Since that's structurally identical to a real Windows install, the
+    same My Games / Saved Games / Documents / AppData heuristics apply, just
+    rooted inside the prefix.
+
+    The prefix is found by structure rather than by one hardcoded path.
+    Proton's own layout is compatdata/<AppID>/pfx/drive_c/users/steamuser, but
+    the prefix directory, the drive letter and the account folder name are all
+    conventions of the tool that built the prefix, not guarantees from Steam:
+    a prefix shared between Proton builds, or created outside Steam entirely,
+    need not match any of them. So every user folder in every drive is
+    searched, and every folder inside a save location is considered, instead
+    of losing the game to a name that didn't match.
+
+    Every prefix belongs to exactly one AppID, so (like native Steam userdata)
+    results are only surfaced when the AppID resolves to a real name, and
+    labeled with that name rather than a raw folder name for accuracy."""
     results = []
     compatdata = os.path.join(steam_root, "steamapps", "compatdata")
     app_names = _read_steam_app_names(steam_root)
@@ -1071,48 +1221,17 @@ def scan_proton_prefixes(steam_root: str) -> List[ScanCandidate]:
         if appid not in app_names:
             continue
 
-        win_user_root = os.path.join(appid_dir, "pfx", "drive_c", "users", "steamuser")
-        if not os.path.isdir(win_user_root):
+        user_roots = []
+        for prefix_root in _proton_prefix_roots(appid_dir):
+            user_roots.extend(_proton_user_roots(prefix_root))
+        if not user_roots:
             continue
 
-        found_path = None
-
-        # Same publisher-nesting handling as scan_flat_style — a Proton
-        # prefix is per-game already, so its My Games/Saved Games folder
-        # normally has exactly one real leaf, but resolving through any
-        # publisher-name layer still matters for pointing save_path at the
-        # actual save folder rather than one level too shallow.
-        my_games_subs = _list_subdirs(os.path.join(win_user_root, "Documents", "My Games"))
-        if my_games_subs:
-            resolved = _resolve_game_folders(my_games_subs[0])
-            if resolved:
-                found_path = resolved[0]
-
-        if not found_path:
-            saved_games_subs = _list_subdirs(os.path.join(win_user_root, "Saved Games"))
-            if saved_games_subs:
-                resolved = _resolve_game_folders(saved_games_subs[0])
-                if resolved:
-                    found_path = resolved[0]
-
-        if not found_path:
-            for sub in _list_subdirs(os.path.join(win_user_root, "Documents")):
-                if os.path.basename(sub).lower() not in _DOCUMENTS_EXCLUDE:
-                    found_path = sub
-                    break
-
-        if not found_path:
-            for sub in _list_subdirs(os.path.join(win_user_root, "AppData", "Local")):
-                if os.path.basename(sub).lower() in _APPDATA_EXCLUDE:
-                    continue
-                save_dir = _find_save_subfolder(sub)
-                if save_dir and _has_any_files(save_dir):
-                    found_path = save_dir
-                    break
-
-        if found_path and _has_any_files(found_path):
+        # Deduped and sorted so one prefix always surfaces its candidates in
+        # the same order, however the filesystem happened to list them.
+        for save_path in sorted(set(_proton_save_paths(user_roots))):
             results.append(ScanCandidate(
-                name=app_names[appid], save_path=found_path,
+                name=app_names[appid], save_path=save_path,
                 source="Proton", confidence="high",
             ))
 

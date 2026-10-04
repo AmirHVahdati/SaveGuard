@@ -242,6 +242,29 @@ class TestResolveGameFolders:
 # My Games / Saved Games
 # ---------------------------------------------------------------------------
 
+def make_proton_prefix(root, appid, name, files):
+    """Build one Proton prefix in a layout of the test's choosing.
+
+    files -- {path relative to compatdata/<appid>: contents}, so a test can put
+             the saves somewhere other than the layout Proton itself writes:
+             a renamed prefix directory, a differently named account folder, a
+             second drive, tracked_files/ and lock files alongside the prefix.
+
+    make_steam_install only builds the exact layout Steam writes, which is the
+    one case that was never in question.
+    """
+    steam = Path(root)
+    appid_dir = steam / "steamapps" / "compatdata" / appid
+    appid_dir.mkdir(parents=True, exist_ok=True)
+    for relative, contents in files.items():
+        path = appid_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    (steam / "steamapps" / f"appmanifest_{appid}.acf").write_text(
+        ACF_TEMPLATE.format(appid=appid, name=name), encoding="utf-8")
+    return steam
+
+
 class TestScanFlatStyle:
     def test_each_subfolder_is_a_high_confidence_game(self, tmp_path, write_save_tree):
         root = write_save_tree(tmp_path, {
@@ -275,6 +298,21 @@ class TestScanFlatStyle:
 
     def test_missing_root_yields_nothing(self, tmp_path):
         assert scan_flat_style(str(tmp_path / "nope"), "My Games") == []
+
+    def test_every_game_in_the_root_is_surfaced(self, tmp_path, write_save_tree):
+        # Not just whichever child the filesystem happened to list first: two
+        # studios in one My Games folder meant one of them never appeared.
+        # (A folder named for a studio this module doesn't know is still
+        # labelled by itself rather than descended into -- that is
+        # _resolve_game_folders' publisher list, shared with the Windows scans.)
+        root = write_save_tree(tmp_path, {
+            "CD Projekt Red/Cyberpunk 2077/slot.sav": "a",
+            "Bethesda/Fallout/save.dat": "b",
+            "Hades/slot.sav": "c",
+        })
+        assert names_of(scan_flat_style(str(root), "My Games")) == [
+            "Cyberpunk 2077", "Fallout", "Hades",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +841,145 @@ class TestScanProtonPrefixes:
             os.path.join("Documents", "Steam"): {"a": "x"},
         })
         assert scan_proton_prefixes(str(steam)) == []
+
+    # -----------------------------------------------------------------------
+    # The prefix was found by one hardcoded path. The prefix directory, the
+    # drive letter and the account folder are all conventions of whatever tool
+    # built the prefix rather than guarantees from Steam, so a prefix that
+    # didn't match all three returned nothing at all for that game.
+    # -----------------------------------------------------------------------
+
+    def test_differently_named_account_folder(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "101", "Game One", {
+            "pfx/drive_c/users/gamer/Documents/My Games/GameOne/slot.sav": "x",
+        })
+        candidate = only(scan_proton_prefixes(str(steam)))
+        assert candidate.name == "Game One"
+        assert candidate.save_path.endswith(
+            os.path.join("users", "gamer", "Documents", "My Games", "GameOne"))
+
+    def test_renamed_prefix_directory(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "102", "Game Two", {
+            "wine/drive_c/users/steamuser/Documents/My Games/GameTwo/slot.sav": "x",
+        })
+        assert only(scan_proton_prefixes(str(steam))).save_path.endswith(
+            os.path.join("wine", "drive_c", "users", "steamuser", "Documents",
+                         "My Games", "GameTwo"))
+
+    def test_prefix_relinked_to_another_disk(self, tmp_path, junction):
+        # A prefix moved off the Steam library is normally linked back into
+        # place. Finding it needs a symlink-following listing: _list_subdirs
+        # (correctly, for save folders) does not follow links, so the old
+        # hardcoded path only kept working here by accident.
+        elsewhere = write_files(Path(tmp_path) / "elsewhere" / "103", {
+            "drive_c/users/steamuser/Documents/My Games/GameMoved/slot.sav": "x",
+        })
+        steam = make_proton_prefix(tmp_path / "Steam", "103", "Game Moved", {})
+        junction(elsewhere, "pfx",
+                 parent=steam / "steamapps" / "compatdata" / "103")
+        assert only(scan_proton_prefixes(str(steam))).save_path.endswith(
+            os.path.join("drive_c", "users", "steamuser", "Documents", "My Games",
+                         "GameMoved"))
+
+    def test_saves_on_a_second_drive(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "104", "Game Two Drives", {
+            "pfx/drive_d/users/steamuser/Documents/My Games/TwoDrive/slot.sav": "x",
+        })
+        assert only(scan_proton_prefixes(str(steam))).save_path.endswith(
+            os.path.join("drive_d", "users", "steamuser", "Documents", "My Games",
+                         "TwoDrive"))
+
+    def test_shared_user_folders_are_not_mistaken_for_a_person(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "105", "Game Shared", {
+            "pfx/drive_c/users/Public/shared stuff.txt": "x",
+            "pfx/drive_c/users/Default User/some junk.txt": "y",
+            "pfx/drive_c/users/steamuser/Documents/My Games/GameShared/slot.sav": "z",
+        })
+        assert paths_of(scan_proton_prefixes(str(steam))) == [
+            str(steam / "steamapps" / "compatdata" / "105" / "pfx" / "drive_c"
+                / "users" / "steamuser" / "Documents" / "My Games" / "GameShared"),
+        ]
+
+    def test_dosdevices_link_does_not_duplicate_the_save(self, tmp_path, make_symlink):
+        # Wine links dosdevices/c: at drive_c, so following both spellings of
+        # one drive would offer the user the same folder twice under two paths.
+        # The link is named "c-drive" rather than "c:" because Windows reads a
+        # trailing colon in a path component as a drive, not a folder.
+        steam = make_proton_prefix(tmp_path / "Steam", "106", "Game Dos", {
+            "pfx/drive_c/users/steamuser/Documents/My Games/GameDos/slot.sav": "x",
+        })
+        pfx = steam / "steamapps" / "compatdata" / "106" / "pfx"
+        (pfx / "dosdevices").mkdir()
+        make_symlink(pfx / "drive_c", "c-drive", parent=pfx / "dosdevices")
+        assert len(scan_proton_prefixes(str(steam))) == 1
+
+    def test_non_prefix_siblings_are_ignored(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "107", "Game Sibling", {
+            "pfx/drive_c/users/steamuser/Documents/My Games/GameSibling/slot.sav": "x",
+            "tracked_files/depot_1/state.vdf": "x",
+            "config_info": "x",
+            "pfx.lock": "x",
+        })
+        assert paths_of(scan_proton_prefixes(str(steam))) == [
+            str(steam / "steamapps" / "compatdata" / "107" / "pfx" / "drive_c"
+                / "users" / "steamuser" / "Documents" / "My Games" / "GameSibling"),
+        ]
+
+    # -----------------------------------------------------------------------
+    # Only the first folder listed under My Games / Saved Games was read, so
+    # anything else in there was simply never scanned.
+    # -----------------------------------------------------------------------
+
+    def test_every_game_in_my_games_is_surfaced(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "108", "Shared Prefix", {
+            "pfx/drive_c/users/steamuser/Documents/My Games/Alpha/slot.sav": "x",
+            "pfx/drive_c/users/steamuser/Documents/My Games/Beta/slot.sav": "y",
+        })
+        results = scan_proton_prefixes(str(steam))
+        assert len(results) == 2
+        assert all(c.name == "Shared Prefix" for c in results)
+        assert [os.path.basename(p) for p in paths_of(results)] == ["Alpha", "Beta"]
+
+    def test_every_publisher_in_saved_games_is_surfaced(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "109", "Shared Prefix", {
+            "pfx/drive_c/users/steamuser/Saved Games/Bethesda/Fallout/slot.sav": "x",
+            "pfx/drive_c/users/steamuser/Saved Games/FromSoftware/Sekiro/slot.sav": "y",
+        })
+        assert len(scan_proton_prefixes(str(steam))) == 2
+
+    def test_one_location_kind_across_users_is_not_ordered_by_account(self, tmp_path):
+        # The account with the authoritative location wins even when it is
+        # listed second: searching one location kind at a time across every
+        # account is what keeps a weaker Documents hit in account A from
+        # hiding a My Games save in account B.
+        steam = make_proton_prefix(tmp_path / "Steam", "110", "Two Accounts", {
+            "pfx/drive_c/users/aaa/Documents/Loose Save/slot.sav": "x",
+            "pfx/drive_c/users/zzz/Documents/My Games/Real Game/slot.sav": "y",
+        })
+        assert paths_of(scan_proton_prefixes(str(steam))) == [
+            str(steam / "steamapps" / "compatdata" / "110" / "pfx" / "drive_c"
+                / "users" / "zzz" / "Documents" / "My Games" / "Real Game"),
+        ]
+
+    def test_every_account_in_the_prefix_is_searched(self, tmp_path):
+        # Two Wine accounts in one prefix: preferring one would drop the
+        # other's saves rather than just ordering them.
+        steam = make_proton_prefix(tmp_path / "Steam", "111", "Two Accounts", {
+            "pfx/drive_c/users/aaa/Documents/My Games/Leftbeind/slot.sav": "x",
+            "pfx/drive_c/users/steamuser/Documents/My Games/Real Game/slot.sav": "y",
+        })
+        assert [os.path.basename(p) for p in paths_of(
+            scan_proton_prefixes(str(steam)))] == ["Leftbeind", "Real Game"]
+
+    def test_repeated_scans_return_the_same_order(self, tmp_path):
+        steam = make_proton_prefix(tmp_path / "Steam", "112", "Stable Order", {
+            "pfx/drive_c/users/steamuser/Documents/My Games/Alpha/slot.sav": "x",
+            "pfx/drive_c/users/steamuser/Documents/My Games/Beta/slot.sav": "y",
+            "pfx/drive_c/users/steamuser/Documents/My Games/Gamma/slot.sav": "z",
+        })
+        runs = [paths_of(scan_proton_prefixes(str(steam))) for _ in range(3)]
+        assert runs[0] == runs[1] == runs[2]
+        assert [os.path.basename(p) for p in runs[0]] == ["Alpha", "Beta", "Gamma"]
 
 
 class TestSteamRoots:
