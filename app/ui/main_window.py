@@ -9,7 +9,7 @@ more than once per game per user action (see _recompute_statuses).
 
 import os
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QEvent
+from PySide6.QtCore import Qt, QTimer, QUrl, QEvent, QThread, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -45,6 +45,69 @@ VIRTUAL_BUFFER = 3
 CARD_HEIGHT = 268  # a card is closer to 128px; this is a conservative bound
 
 
+def _status_for(save_path, last_backup_time, last_snapshot) -> str:
+    """The backup status of one game, from its fields alone.
+
+    Split out of MainWindow._compute_status so the off-thread sweep and the
+    synchronous single-game path cannot drift apart: both must agree on what
+    "changed" means, or a game could read one way right after a backup and the
+    other way on the next rescan.
+    """
+    if not save_path or not os.path.isdir(save_path):
+        return "invalid"
+    if last_backup_time is None:
+        return "never"
+    current = build_snapshot(save_path)
+    if snapshots_differ(last_snapshot, current):
+        return "changed"
+    return "synced"
+
+
+class StatusWorker(QThread):
+    """Computes backup statuses for a batch of games, off the main thread.
+
+    Walking a save folder is filesystem I/O, and doing it inline does not merely
+    slow the window down, it starves the event loop completely: measured with a
+    5ms QTimer running, a sweep of 60 already-backed-up games produced zero
+    timer deliveries across its 461ms. The window is already painted by the time
+    a startup sweep runs, so there is no partial frame to suggest progress —
+    the window simply stops responding until it finishes, which on a slow drive
+    or a large library is long enough to read as a hang.
+
+    Takes plain tuples rather than Game objects deliberately. The main thread
+    adds, edits and removes games while this runs, so reading a Game's fields
+    from here would race those edits; everything a status depends on is copied
+    out first, and the answer comes back as a plain {game_id: status} dict for
+    the main thread to apply, skipping any game that has since been deleted.
+
+    Only games that already have a backup reach the filesystem at all (see
+    _status_for), so the sweep is cheap for a library that has never been
+    backed up and proportional to total file count otherwise.
+    """
+
+    # Named status_* rather than `finished`, which QThread already defines and
+    # which fires only once the OS thread has actually terminated. Same
+    # reasoning as BackupWorker.backup_finished.
+    status_finished = Signal(dict)   # {game_id: "invalid"|"never"|"changed"|"synced"}
+    status_error = Signal(str)
+
+    def __init__(self, targets, parent=None):
+        """targets: iterable of (game_id, save_path, last_backup_time, last_snapshot)."""
+        super().__init__(parent)
+        self.targets = list(targets)
+
+    def run(self):
+        statuses = {}
+        for game_id, save_path, last_backup_time, last_snapshot in self.targets:
+            try:
+                statuses[game_id] = _status_for(save_path, last_backup_time, last_snapshot)
+            except OSError as exc:
+                # One unreadable folder must not abandon the rest of the
+                # library's statuses; report it and carry on.
+                self.status_error.emit(f"{game_id}: {exc}")
+        self.status_finished.emit(statuses)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -58,6 +121,8 @@ class MainWindow(QMainWindow):
         self.workers: dict[str, BackupWorker] = {}
         self.status_cache: dict[str, str] = {}  # game_id -> status, refreshed on demand
         self.scan_worker: GameScanWorker = None
+        self.status_worker: StatusWorker = None
+        self._show_summary_after_statuses: bool = False
         self.settings: dict = load_settings()
         self._status_update_pending: bool = False  # for batching UI updates during backup completions
 
@@ -486,18 +551,17 @@ class MainWindow(QMainWindow):
     # actually changed.
 
     def _compute_status(self, game: Game) -> str:
-        if not game.save_path or not os.path.isdir(game.save_path):
-            return "invalid"
-        if game.last_backup_time is None:
-            return "never"
-        current = build_snapshot(game.save_path)
-        if snapshots_differ(game.last_snapshot, current):
-            return "changed"
-        return "synced"
+        return _status_for(game.save_path, game.last_backup_time, game.last_snapshot)
 
     def _recompute_statuses(self, game_ids=None):
         """Walk save folders and refresh the cache. Pass game_ids to limit
-        the (potentially slow) disk work to just the games that need it."""
+        the (potentially slow) disk work to just the games that need it.
+
+        Synchronous on purpose. This is the path taken when one game is added,
+        edited or discovered, where the answer is needed immediately and there
+        is exactly one folder to walk -- a few milliseconds. The whole-library
+        sweeps go through _start_status_sweep instead.
+        """
         targets = (
             [self.games[gid] for gid in game_ids if gid in self.games]
             if game_ids is not None
@@ -506,28 +570,90 @@ class MainWindow(QMainWindow):
         for game in targets:
             self.status_cache[game.id] = self._compute_status(game)
 
-    def _recompute_and_refresh(self):
-        """Recompute statuses for all games and update the UI in one pass.
-        Used after the first scan completes or when explicitly requested."""
-        self._recompute_statuses()
+    def _status_sweep_targets(self) -> list:
+        """Everything a status depends on, copied out for the worker.
+
+        Tuples rather than Game objects: the main thread keeps editing games
+        while the worker walks, and handing it live references would race those
+        edits (see StatusWorker).
+        """
+        return [
+            (game.id, game.save_path, game.last_backup_time, game.last_snapshot)
+            for game in self.games.values()
+        ]
+
+    def _start_status_sweep(self, show_summary: bool = False):
+        """Recompute every game's status on a worker thread, then refresh the UI.
+
+        Used by the startup path and by Rescan. Refuses to start a second sweep
+        while one is in flight: both cover the whole library, so a running one
+        already produces the answer a new request would, and overlapping walks
+        would only contend for the same disks.
+        """
+        if self.status_worker is not None:
+            return
+        targets = self._status_sweep_targets()
+        if not targets:
+            # Nothing tracked: still let the caller run whatever it does after
+            # a sweep, rather than leaving it waiting on a signal that will
+            # never come.
+            if show_summary:
+                self._show_startup_summary()
+            return
+
+        self._show_summary_after_statuses = show_summary
+        # No parent, matching GameScanWorker: a QThread destroyed while it is
+        # still running is a fatal Qt error, so the thread must not be a child
+        # of a widget that can be closed underneath it. closeEvent waits for it.
+        worker = StatusWorker(targets)
+        worker.status_finished.connect(self._on_status_finished)
+        worker.status_error.connect(self._on_status_error)
+        # Drop the reference only once QThread's own `finished` confirms the OS
+        # thread has terminated, not when the result signal arrives -- same
+        # pattern as GameScanWorker.
+        worker.finished.connect(self._on_status_thread_finished)
+        self.status_worker = worker
+        worker.start()
+
+    def _on_status_thread_finished(self):
+        self.status_worker = None
+
+    def _on_status_error(self, message: str):
+        self.status_bar.showMessage(f"Couldn't check one save folder: {message}", 6000)
+
+    def _on_status_finished(self, statuses: dict):
+        for game_id, status in statuses.items():
+            # A game deleted while the sweep was walking is simply not in
+            # self.games any more, so its status has nowhere to go.
+            if game_id in self.games:
+                self.status_cache[game_id] = status
         for game_id, card in self.cards.items():
             card.set_status(self.status_cache.get(game_id, "invalid"))
         self._flush_status_update()
+        if self._show_summary_after_statuses:
+            self._show_summary_after_statuses = False
+            self._show_startup_summary()
 
     def _on_startup_status_ready(self):
-        """Called via QTimer after the window is first shown. Computes save
-        folder statuses (which can take time on large folders) without
-        blocking the initial window paint."""
-        self._recompute_and_refresh()
-        self._show_startup_summary()
+        """Called via QTimer after the window is first shown.
+
+        Defers the sweep rather than skipping it: the walk is real I/O over
+        every tracked save folder, and running it here without a worker froze
+        the event loop outright (see StatusWorker). The window is painted by
+        the time this runs, which is what the timer was for; the freeze it was
+        never going to prevent is what the worker is for.
+        """
+        self._start_status_sweep(show_summary=True)
 
     def _rescan_all(self):
         """Full manual rescan — used by the 'Rescan' button. Walks every
-        tracked save folder exactly once."""
-        self._recompute_statuses()
-        for game_id, card in self.cards.items():
-            card.set_status(self.status_cache.get(game_id, "invalid"))
-        self._flush_status_update()
+        tracked save folder exactly once, on a worker thread so the window
+        stays responsive while it does."""
+        if self.status_worker is not None:
+            self.status_bar.showMessage("A status check is already running…", 3000)
+            return
+        self.status_bar.showMessage("Checking save folders…")
+        self._start_status_sweep()
 
     def _show_startup_summary(self):
         needing = [g.name for g in self.games.values() if self.status_cache.get(g.id) in ("changed", "never")]
@@ -751,6 +877,15 @@ class MainWindow(QMainWindow):
                 # and the user can continue using the app while backups run.
                 event.ignore()
                 return
+
+        # A status sweep only reads, so quitting during one costs nothing --
+        # unlike a backup, there is no half-written archive to worry about, and
+        # it is deliberately kept out of the prompt above. But the thread object
+        # cannot be destroyed while it is running, which Qt treats as a fatal
+        # error, so it has to be waited out rather than abandoned. The walk is
+        # bounded and off the critical path, so this is a formality.
+        if self.status_worker is not None and self.status_worker.isRunning():
+            self.status_worker.wait(5000)
 
         event.accept()
 

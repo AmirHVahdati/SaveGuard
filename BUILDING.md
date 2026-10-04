@@ -105,20 +105,38 @@ failures.
 
 Two Qt behaviours catch people out:
 
-- **The window recomputes every game's status as soon as the event loop turns.**
-  State written during fixture *setup* can therefore be overwritten before the
-  test body runs. Set it up in the test body instead.
+- **Status sweeps are asynchronous.** Walking every save folder is real disk I/O,
+  so `_on_startup_status_ready` and `_rescan_all` both hand the work to a
+  `StatusWorker` thread rather than blocking the event loop. Two consequences:
+  the sweep a window schedules in `__init__` fires whenever the event loop
+  happens to turn, so it can land mid-test with results computed from whatever
+  the game looked like then; and a sweep started inside a test body has not
+  finished when the assertions run, leaving `status_cache` empty.
+  `tests/test_ui_main_window.py` therefore has an **autouse**
+  `inline_status_sweeps` fixture that substitutes a `StatusWorker` subclass
+  running inline, which makes the file deterministic and restores the old
+  "the cache is filled when the call returns" behaviour. The real class is kept
+  as `_REAL_STATUS_WORKER` so `TestStatusSweepIsOffThread` can still test the
+  threading directly.
 - **An unshown offscreen window reports `isVisible() == False` for every child.**
   Test visibility with `isHidden()`, not `isVisible()`.
+
+Note what the inline fixture does *not* paper over: a game whose status is set
+up during fixture *setup* can still be recomputed before the test body runs, so
+keep doing that in the body.
 
 For anything that needs a dialog or a background thread:
 
 - `message_spy` captures `QMessageBox.warning/critical/information/question`
   calls instead of showing them, so a test can assert on the dialog that appeared.
+  Only `question` is stubbed automatically; a test that triggers a `warning`
+  without `message_spy` opens a real modal box and hangs the whole run.
 - `FakeBackupWorker` and `FakeScanWorker` in `tests/test_ui_main_window.py`
   replace the real workers. They subclass `QObject` so their signals still
   connect, define `finished` because the window waits on that signal before
   dropping its reference, record how they were constructed, and never start.
+- A test that starts a real thread should `worker.wait()` in a `finally`, or the
+  OS thread can outlive the test and take the interpreter down with it.
 
 ---
 

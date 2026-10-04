@@ -13,9 +13,11 @@ done, so nothing here touches the real ~/.saveguard or scans the real disk.
 
 import json
 import os
+import threading
+import time
 
 import pytest
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtGui import QDesktopServices, QResizeEvent
 from PySide6.QtWidgets import QMessageBox, QPushButton
 
@@ -195,6 +197,45 @@ def fake_workers(monkeypatch):
     return FakeBackupWorker
 
 
+# The real class, captured at import time -- before the autouse fixture below
+# substitutes its inline subclass into the main_window namespace.
+_REAL_STATUS_WORKER = main_window_module.StatusWorker
+
+
+class _InlineStatusWorker(_REAL_STATUS_WORKER):
+    """A StatusWorker that runs on the calling thread and never spawns one.
+
+    finished() is emitted explicitly because that is what the real thread
+    machinery emits, and it is what releases MainWindow's in-flight guard; a
+    direct run() alone would leave the window permanently refusing sweeps.
+    """
+
+    def start(self):
+        self.run()
+        self.finished.emit()
+
+
+@pytest.fixture(autouse=True)
+def inline_status_sweeps(monkeypatch):
+    """Runs every status sweep on the calling thread, for this whole file.
+
+    The sweep is asynchronous in the app so the event loop keeps running while
+    it walks save folders. Two things follow for tests. A sweep started by
+    _on_startup_status_ready is scheduled by a QTimer in __init__, so it fires
+    whenever the event loop happens to turn -- mid-test, unpredictably, and
+    landing results computed from whatever the game looked like then. And a
+    sweep started inside a test body would still be running when the assertions
+    run, leaving status_cache empty.
+
+    Substituting a subclass whose start() runs inline makes the whole file
+    deterministic and restores the pre-worker semantics: by the time _rescan_all
+    returns, the cache is filled. The module-level reference to the real class
+    is kept below so the threading itself can still be tested directly --
+    see TestStatusSweepIsOffThread.
+    """
+    monkeypatch.setattr(main_window_module, "StatusWorker", _InlineStatusWorker)
+
+
 @pytest.fixture
 def fake_scans(monkeypatch):
     FakeScanWorker.instances.clear()
@@ -271,7 +312,7 @@ class TestStatusCache:
     def test_cards_are_updated_by_the_refresh_pass(self, tracked, main_window):
         card = main_window.cards[tracked.id]
         card.set_status("never")
-        main_window._recompute_and_refresh()
+        main_window._start_status_sweep()
         assert card.status == main_window.status_cache[tracked.id]
 
 
@@ -1012,8 +1053,204 @@ class TestRescan:
         assert main_window.status_cache[tracked.id] == "changed"
 
     def test_the_button_does_it(self, main_window, tracked, fake_workers):
+        # Cleared first, or this passes on the status the `tracked` fixture
+        # left behind rather than on anything the rescan did.
+        main_window.status_cache.clear()
         button_named(main_window, "Rescan").click()
         assert tracked.id in main_window.status_cache
+
+
+# ---------------------------------------------------------------------------
+# the whole-library sweep runs off the main thread
+# ---------------------------------------------------------------------------
+
+class TestStatusSweepIsOffThread:
+    """The bug: walking every save folder inline starved the event loop
+    outright -- a 5ms timer received zero deliveries across a 461ms sweep. So
+    what matters is not only that the statuses are right, but that the walk
+    happens on another thread.
+
+    The file-wide inline_status_sweeps fixture keeps MainWindow's own sweeps
+    synchronous for determinism, so the threading is exercised here against the
+    real class directly.
+    """
+
+    def test_the_walk_runs_on_another_thread(self, save_root, qtbot, monkeypatch):
+        walked_on = []
+
+        def record(save_path, last_backup_time, last_snapshot):
+            walked_on.append(threading.get_ident())
+            return "synced"
+
+        monkeypatch.setattr(main_window_module, "_status_for", record)
+        results = []
+        worker = _REAL_STATUS_WORKER([("game-1", str(save_root), "2026-01-01", None)])
+        worker.status_finished.connect(results.append)
+        try:
+            worker.start()
+            qtbot.waitUntil(lambda: bool(results), timeout=5000)
+        finally:
+            worker.wait()   # never leave the OS thread running past the test
+        assert walked_on
+        assert walked_on[0] != threading.get_ident()
+
+    def test_the_worker_reports_every_game_it_was_given(self, save_root, qtbot):
+        results = []
+        worker = _REAL_STATUS_WORKER([
+            ("a", str(save_root), "2026-01-01", None),
+            ("b", str(save_root), None, None),
+            ("c", str(save_root), "2026-01-01", {}),
+        ])
+        worker.status_finished.connect(results.append)
+        try:
+            worker.start()
+            qtbot.waitUntil(lambda: bool(results), timeout=5000)
+        finally:
+            worker.wait()
+        assert set(results[0]) == {"a", "b", "c"}
+        assert results[0]["b"] == "never"   # never backed up: no disk work at all
+
+    def test_an_unreadable_folder_is_reported_without_losing_the_rest(
+            self, save_root, monkeypatch):
+        def record(save_path, last_backup_time, last_snapshot):
+            if save_path == "denied":
+                raise OSError(5, "Access is denied")
+            return "synced"
+
+        monkeypatch.setattr(main_window_module, "_status_for", record)
+        errors, results = [], []
+        worker = _REAL_STATUS_WORKER([
+            ("a", str(save_root), "2026-01-01", None),
+            ("b", "denied", "2026-01-01", None),
+        ])
+        worker.status_error.connect(errors.append)
+        worker.status_finished.connect(results.append)
+        worker.run()
+
+        assert errors and "denied" in errors[0]
+        # The other game's status still arrives: one unreadable folder must not
+        # abandon the rest of the library. The failed one is simply absent, so
+        # it keeps whatever status it already had rather than being given a
+        # guess.
+        assert set(results[0]) == {"a"}
+
+    def test_the_worker_does_not_shadow_qthreads_own_finished_signal(self):
+        # Callers wait on `finished` knowing the OS thread has really ended.
+        worker = _REAL_STATUS_WORKER([])
+        assert "finished" not in type(worker).__dict__
+        assert hasattr(worker.finished, "connect")
+
+    def test_a_game_deleted_mid_sweep_is_not_resurrected(self, main_window, tracked):
+        # The `tracked` fixture fills the cache, so start from empty.
+        main_window.status_cache.clear()
+        main_window.games.pop(tracked.id)
+        main_window._start_status_sweep()
+        # The worker still returns an answer for it; applying that would put a
+        # status in the cache for a game that no longer exists.
+        assert tracked.id not in main_window.status_cache
+
+    def test_the_in_flight_guard_is_released_after_a_sweep(self, main_window, tracked):
+        main_window._start_status_sweep()
+        assert main_window.status_worker is None   # cleared once finished fires
+
+    def test_a_second_sweep_while_one_is_running_is_refused(self, main_window,
+                                                            tracked, monkeypatch):
+        released = []
+        monkeypatch.setattr(
+            main_window_module.StatusWorker, "start",
+            lambda self: released.append(self),   # never finishes
+        )
+        main_window._start_status_sweep()
+        first = main_window.status_worker
+
+        main_window._rescan_all()
+
+        # Both cover the whole library, so the running one already answers it.
+        assert main_window.status_worker is first
+        assert len(released) == 1
+
+    def test_the_guard_is_reported_rather_than_silently_ignored(self, main_window,
+                                                               tracked, monkeypatch):
+        monkeypatch.setattr(
+            main_window_module.StatusWorker, "start", lambda self: None)
+        main_window._start_status_sweep()
+        main_window.status_bar.clearMessage()
+
+        main_window._rescan_all()
+
+        assert "already running" in main_window.status_bar.currentMessage()
+
+    def test_startup_sweeps_through_the_worker(self, main_window, tracked):
+        started = []
+        monkey_target = main_window_module.StatusWorker
+
+        class Recording(monkey_target):
+            def start(self):
+                started.append(self)
+                self.run()
+                self.finished.emit()
+
+        main_window_module.StatusWorker = Recording
+        try:
+            main_window.status_cache.clear()
+            main_window._on_startup_status_ready()
+        finally:
+            main_window_module.StatusWorker = monkey_target
+
+        assert len(started) == 1
+        assert tracked.id in main_window.status_cache
+
+    def test_the_welcome_summary_follows_the_startup_sweep(self, main_window, tracked):
+        main_window.status_bar.clearMessage()
+        main_window._on_startup_status_ready()
+        assert "need a backup" in main_window.status_bar.currentMessage()
+
+    def test_nothing_to_check_still_shows_the_summary(self, main_window):
+        # No games means no worker and therefore no signal; the caller must not
+        # be left waiting for one that will never arrive.
+        main_window.status_bar.clearMessage()
+        main_window._on_startup_status_ready()
+        assert main_window.status_worker is None
+
+    def test_a_single_game_update_stays_synchronous(self, main_window, tracked):
+        # One folder is a few milliseconds and its answer is needed right now,
+        # so this path deliberately does not go through a worker -- the result
+        # is in the cache by the time the call returns, with nothing started.
+        started = []
+        monkey_target = main_window_module.StatusWorker
+        main_window_module.StatusWorker = type(
+            "Recording", (monkey_target,), {"start": lambda self: started.append(self)}
+        )
+        try:
+            main_window.status_cache.clear()
+            main_window._recompute_statuses(game_ids=[tracked.id])
+        finally:
+            main_window_module.StatusWorker = monkey_target
+
+        assert tracked.id in main_window.status_cache
+        assert started == []
+
+    def test_closing_waits_for_a_running_sweep(self, main_window, tracked, monkeypatch):
+        # A QThread destroyed while it is running is a fatal Qt error, and the
+        # worker is deliberately not parented to the window, so closeEvent has
+        # to let it finish rather than drop the last reference to it.
+        def slow(save_path, last_backup_time, last_snapshot):
+            time.sleep(0.05)
+            return "synced"
+
+        monkeypatch.setattr(main_window_module, "_status_for", slow)
+        monkeypatch.setattr(main_window_module, "StatusWorker", _REAL_STATUS_WORKER)
+        main_window._start_status_sweep()
+        worker = main_window.status_worker
+        assert worker.isRunning()
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is True
+        # No prompt for a read-only sweep, but it was waited out rather than
+        # abandoned -- so the thread object is safe to destroy.
+        assert not worker.isRunning()
 
 
 # ---------------------------------------------------------------------------
