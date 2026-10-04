@@ -68,7 +68,7 @@ from typing import List, Optional, Set, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
-from app.utils import mark_visited
+from app.utils import comparable_path_key, mark_visited
 
 
 @dataclass
@@ -1323,11 +1323,18 @@ def discover_candidates(
             candidates += scan_steam_userdata(steam_root)
             candidates += scan_proton_prefixes(steam_root)
 
-    normalized_existing = {os.path.normcase(os.path.normpath(p)) for p in existing_paths}
+    # Two spellings of one folder are one folder. Comparing resolved identity
+    # (path_key, which normalises and follows links) rather than the text means
+    # a save folder reached through a symlink or junction is recognised as the
+    # one already tracked rather than offered again -- which is what the rest of
+    # the app already assumes, since paths_conflict and the backup containment
+    # check both compare with the same helper. normpath alone leaves the link in
+    # the string and never matches.
+    normalized_existing = {comparable_path_key(p) for p in existing_paths}
     seen = set()
     unique: List[ScanCandidate] = []
     for c in candidates:
-        key = os.path.normcase(os.path.normpath(c.save_path))
+        key = comparable_path_key(c.save_path)
         if key in normalized_existing or key in seen:
             continue
         seen.add(key)

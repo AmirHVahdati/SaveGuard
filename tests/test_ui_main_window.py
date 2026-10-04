@@ -1527,16 +1527,20 @@ class TestAddScannedGames:
 
     def test_persists_every_game(self, main_window, save_root, tmp_path):
         main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        # Two distinct folders: two candidates naming one folder is a duplicate,
+        # not a second game (see TestAddScannedGamesDeduplication).
+        second = write_files(tmp_path / "saves" / "Celeste", {"slot.sav": "a"})
         self.scan(main_window,
                    self.candidate(save_root, "Hades"),
-                   self.candidate(save_root, "Celeste"))
+                   self.candidate(second, "Celeste"))
         assert len(config.load_games()) == 2
 
     def test_reports_how_many_were_added(self, main_window, save_root, tmp_path):
         main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        second = write_files(tmp_path / "saves" / "Celeste", {"slot.sav": "a"})
         self.scan(main_window,
                    self.candidate(save_root, "Hades"),
-                   self.candidate(save_root, "Celeste"))
+                   self.candidate(second, "Celeste"))
         assert "Added 2 games from scan" in main_window.status_bar.currentMessage()
 
     def test_one_game_is_reported_in_the_singular(self, main_window, save_root, tmp_path):
@@ -1546,9 +1550,10 @@ class TestAddScannedGames:
 
     def test_cards_are_added_in_sorted_order(self, main_window, save_root, tmp_path):
         main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        second = write_files(tmp_path / "saves" / "Zelda", {"slot.sav": "a"})
         self.scan(main_window,
                    self.candidate(save_root, "Zelda"),
-                   self.candidate(save_root, "Another Game"))
+                   self.candidate(second, "Another Game"))
         assert card_order(main_window) == ["Another Game", "Zelda"]
 
     def test_only_the_new_folders_are_walked(self, main_window, save_root, tmp_path,
@@ -1570,6 +1575,157 @@ class TestAddScannedGames:
     def test_nothing_added_means_nothing_happens(self, main_window):
         self.scan(main_window)
         assert main_window.games == {}
+
+
+class TestAddScannedGamesDeduplication:
+    """Adding from a scan must never produce a second game for one folder.
+
+    The scanner filters candidates against the tracked paths, but that check
+    lives in another module and runs at scan time. _add_scanned_games is the
+    point where a Game -- with its own id, its own backup folder and its own
+    row in games.json -- actually comes into existence, so it is the last
+    place a duplicate can be stopped, and the only one that sees both the
+    candidates and the games they would duplicate.
+    """
+
+    def candidate(self, save_root, name="Hades"):
+        return game_scanner.ScanCandidate(name, str(save_root), "My Games", "high")
+
+    def test_a_folder_already_tracked_is_not_added_again(
+            self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Hades", save_root)
+
+        main_window._add_scanned_games([self.candidate(save_root)])
+
+        assert len(main_window.games) == 1
+        # Nothing was added, so nothing was written: no second entry in
+        # games.json, and the tracked game's own record is untouched.
+        assert config.load_games() == []
+
+    def test_the_same_folder_twice_in_one_batch_is_added_once(
+            self, main_window, save_root, tmp_path):
+        # Two scanners describing one folder: a publisher folder and the game
+        # inside it, or two sources reaching the same saves.
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+
+        main_window._add_scanned_games([
+            self.candidate(save_root, "Hades"),
+            self.candidate(save_root, "Hades (Publisher)"),
+        ])
+
+        assert len(main_window.games) == 1
+        assert len(config.load_games()) == 1
+
+    def test_the_newest_spelling_of_a_duplicated_folder_is_dropped(
+            self, main_window, save_root, tmp_path):
+        # Two spellings of one folder inside a single batch: the later one must
+        # not claim the folder, or the user is left with whichever entry
+        # happened to be added last and no idea which is which.
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        spellings = [
+            str(save_root),
+            str(save_root) + os.sep + "SaveData" + os.sep + os.pardir,
+        ]
+
+        main_window._add_scanned_games([
+            self.candidate(save_root, "Hades"),
+            game_scanner.ScanCandidate("Hades", spellings[1], "My Games", "high"),
+        ])
+
+        assert len(main_window.games) == 1
+        assert next(iter(main_window.games.values())).save_path == str(save_root)
+
+    def test_a_link_to_a_tracked_folder_is_not_a_second_game(
+            self, main_window, save_root, tmp_path, junction):
+        # Same folder, reached through a junction. The rest of the app already
+        # treats that as the same folder -- paths_conflict and the backup
+        # containment check both compare with path_key, which resolves links --
+        # so tracking it twice would give one game two save folders the app
+        # believes are different and one of them a backup root that conflicts
+        # with its own save folder.
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Hades", save_root)
+        link = tmp_path / "HadesLink"
+        junction(save_root, link.name, parent=tmp_path)
+
+        main_window._add_scanned_games([self.candidate(link, "Hades")])
+
+        assert len(main_window.games) == 1
+        assert config.load_games() == []
+
+    def test_the_report_counts_only_what_was_actually_added(
+            self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Celeste", tmp_path / "celeste")
+
+        main_window._add_scanned_games([self.candidate(save_root, "Hades")])
+
+        assert "Added 1 game from scan" in main_window.status_bar.currentMessage()
+
+    def test_nothing_added_is_reported_rather_than_counted(
+            self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Hades", save_root)
+
+        main_window._add_scanned_games([self.candidate(save_root)])
+
+        assert "Nothing new to add" in main_window.status_bar.currentMessage()
+        assert "1 folder already tracked" in main_window.status_bar.currentMessage()
+
+    def test_a_mixed_batch_reports_both_halves(self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        other = write_files(tmp_path / "saves" / "Celeste", {"slot.sav": "a"})
+        make_game(main_window, "Celeste", other)
+
+        main_window._add_scanned_games([
+            self.candidate(save_root, "Hades"),
+            self.candidate(other, "Celeste"),
+        ])
+
+        message = main_window.status_bar.currentMessage()
+        assert "Added 1 game from scan" in message
+        assert "Skipped 1 already-tracked folder" in message
+
+    def test_a_genuinely_new_folder_is_still_added_alongside_a_duplicate(
+            self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        other = write_files(tmp_path / "saves" / "Celeste", {"slot.sav": "a"})
+        make_game(main_window, "Celeste", other)
+
+        main_window._add_scanned_games([
+            self.candidate(save_root, "Hades"),
+            self.candidate(other, "Celeste"),
+        ])
+
+        assert sorted(g.name for g in main_window.games.values()) == [
+            "Celeste", "Hades",
+        ]
+
+    def test_a_batch_of_only_duplicates_adds_no_cards(
+            self, main_window, save_root, tmp_path):
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Hades", save_root)
+        before = card_order(main_window)
+
+        main_window._add_scanned_games([self.candidate(save_root, "Hades")])
+
+        assert card_order(main_window) == before
+
+    def test_case_differences_are_not_a_new_game(self, main_window, save_root, tmp_path):
+        # Only meaningful where the filesystem has case to fold; on POSIX
+        # "Hades" and "HADES" really are two folders and both are legitimate.
+        different_case = str(save_root).upper()
+        if different_case == str(save_root):
+            pytest.skip("filesystem path has no case to fold on this platform")
+        main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
+        make_game(main_window, "Hades", save_root)
+
+        main_window._add_scanned_games([
+            game_scanner.ScanCandidate("Hades", different_case, "My Games", "high")
+        ])
+
+        assert len(main_window.games) == 1
 
 
 # ---------------------------------------------------------------------------

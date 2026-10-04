@@ -30,6 +30,26 @@ def path_key(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
+def comparable_path_key(path: str) -> str:
+    """path_key for equality comparisons, with a textual fallback.
+
+    path_key resolves the filesystem, so it can raise on an exotic path (an
+    unresolvable one on Windows, a symlink loop). A duplicate-detection pass
+    runs over every candidate on every scan, where one unreadable path must
+    not abandon the whole comparison -- and where comparing the raw text is
+    still better than not comparing at all.
+
+    Deliberately not folded into path_key: paths_conflict treats an
+    unresolvable path as "no conflict", and quietly turning that into a
+    textual comparison would let a save folder and a backup destination that
+    merely look different be judged unrelated.
+    """
+    try:
+        return path_key(path)
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.normpath(path))
+
+
 def _contains(outer: str, inner: str) -> bool:
     """True if `inner` is `outer` itself or lives somewhere beneath it.
 

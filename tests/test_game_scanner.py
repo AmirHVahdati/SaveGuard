@@ -1330,6 +1330,24 @@ class TestDiscoverCandidates:
             pytest.skip("filesystem path has no case to fold on this platform")
         assert "Hades" not in names_of(self._discover(world, existing=[tracked]))
 
+    def test_a_folder_tracked_through_a_link_is_not_offered_again(
+            self, world, junction):
+        # The game was tracked through a link -- pointed at by hand, or the
+        # folder was moved behind a junction after it was added -- while the
+        # scan reaches it by its real path. Comparing path text cannot see
+        # those as the same folder, so every scan offers the game again, and
+        # the user gets a second entry per scan for a save folder they already
+        # track. The rest of the app resolves links when it compares paths, so
+        # this filter has to agree with it.
+        home, _steam = world
+        tracked = home / "Documents" / "My Games" / "Hades"
+        junction(tracked, "HadesLink", parent=home)
+
+        found = names_of(self._discover(world, existing=[str(home / "HadesLink")]))
+
+        assert "Hades" not in found
+        assert "Hollow Knight" in found
+
     def test_no_duplicate_save_paths(self, world):
         candidates = self._discover(world)
         keys = [os.path.normcase(os.path.normpath(c.save_path)) for c in candidates]

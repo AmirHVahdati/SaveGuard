@@ -22,7 +22,10 @@ from app.scanner import build_snapshot, snapshots_differ
 from app.backup_worker import BackupWorker
 from app.game_scanner import GameScanWorker
 from app.assets import load_icon_pixmap, load_app_icon
-from app.utils import sanitize_folder_name, clamp_compression_level, clamp_max_backups
+from app.utils import (
+    clamp_compression_level, clamp_max_backups, comparable_path_key,
+    sanitize_folder_name,
+)
 from app.ui.game_card import GameCard
 from app.ui.add_game_dialog import AddGameDialog
 from app.ui.scan_results_dialog import ScanResultsDialog
@@ -853,12 +856,40 @@ class MainWindow(QMainWindow):
         backups_root = self.settings.get("default_scan_backup_root") or os.path.join(
             os.path.expanduser("~"), "SaveGuard Backups"
         )
+        # The scanner already filters candidates against the tracked paths, but
+        # that check belongs to another module, runs at scan time, and compares
+        # whatever spelling the folder had then. This is the point where a Game
+        # -- its own id, its own backup folder, its own row in games.json --
+        # comes into existence, so it is the last place a duplicate can be
+        # stopped and the only one that sees both the candidates and the games
+        # they would duplicate. A duplicate is not cosmetic: two games on one
+        # folder means two independent backup histories over the same saves,
+        # and the second one's backup folder conflicts with the save folder the
+        # app otherwise treats as the same directory.
+        #
+        # Comparison is by resolved identity, not by text, and claimed as each
+        # folder is accepted so a batch describing one folder twice (directly
+        # and through a publisher folder, say) keeps only the first.
+        tracked = {comparable_path_key(g.save_path) for g in self.games.values()}
         new_ids = []
+        duplicates = 0
         for candidate in candidates:
+            key = comparable_path_key(candidate.save_path)
+            if key in tracked:
+                duplicates += 1
+                continue
+            tracked.add(key)
             backup_root = os.path.join(backups_root, sanitize_folder_name(candidate.name))
             game = Game.new(candidate.name, candidate.save_path, backup_root)
             self.games[game.id] = game
             new_ids.append(game.id)
+
+        if not new_ids:
+            self.status_bar.showMessage(
+                f"Nothing new to add — {duplicates} folder"
+                f"{'s' if duplicates != 1 else ''} already tracked.", 5000
+            )
+            return
 
         self._persist()
         self._recompute_statuses(game_ids=new_ids)  # only walk the newly added games
@@ -867,9 +898,15 @@ class MainWindow(QMainWindow):
         for game in sorted(new_games, key=lambda g: g.name.lower()):
             self._add_card_for_game(game)
         self._flush_status_update()
-        self.status_bar.showMessage(
-            f"Added {len(candidates)} game{'s' if len(candidates) != 1 else ''} from scan.", 5000
+        message = (
+            f"Added {len(new_ids)} game{'s' if len(new_ids) != 1 else ''} from scan."
         )
+        if duplicates:
+            message += (
+                f" Skipped {duplicates} already-tracked folder"
+                f"{'s' if duplicates != 1 else ''}."
+            )
+        self.status_bar.showMessage(message, 5000)
 
     # ---------------- shutdown ----------------
 
