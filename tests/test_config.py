@@ -161,16 +161,15 @@ class TestSettings:
         assert config.load_settings() == config.DEFAULT_SETTINGS
 
     def test_saved_values_win(self, app_dir):
-        config.save_settings({
-            "compression_level": 9,
-            "max_backups": 5,
-            "default_scan_backup_root": "/tmp/backups",
-        })
-        assert config.load_settings() == {
+        saved = {
             "compression_level": 9,
             "max_backups": 5,
             "default_scan_backup_root": "/tmp/backups",
         }
+        config.save_settings(saved)
+        # Exactly the defaults with the saved values on top: a key the file
+        # doesn't mention still comes from DEFAULT_SETTINGS.
+        assert config.load_settings() == {**config.DEFAULT_SETTINGS, **saved}
 
     def test_missing_keys_fall_back_to_defaults(self, app_dir):
         # A settings.json written by an older version must keep working

@@ -839,12 +839,15 @@ class MainWindow(QMainWindow):
     def _on_open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():
+            was_offered = bool(self.settings.get("auto_scan_on_first_run", True))
             self.settings = dialog.result_settings
             if not save_settings(self.settings):
                 self.status_bar.showMessage(
                     "Settings applied for this session, but couldn't be saved to disk "
                     "— they may not persist after closing SaveGuard.", 8000
                 )
+            if not was_offered and self.settings.get("auto_scan_on_first_run", True):
+                self._rearm_first_scan_offer()
 
     def _on_support_clicked(self):
         QDesktopServices.openUrl(QUrl(SUPPORT_URL))
@@ -852,16 +855,70 @@ class MainWindow(QMainWindow):
     # ---------------- game discovery (scan common save locations) ----------------
 
     def _maybe_run_first_scan(self):
-        """Runs the location scan automatically the very first time the app
-        is opened. A short delay lets the window finish painting first so
-        the results dialog (if anything is found) doesn't pop up before the
-        main window is even visible."""
+        """Offer the location scan the first time the app is opened.
+
+        Asked rather than done. The scan reads Documents, AppData and every
+        Steam library on the machine, which is a lot of disk to walk through
+        unprompted -- slow enough on a spinning drive or a large library to be
+        felt while the app is still opening. It has always been
+        review-before-adding, so nothing lands without a say-so either way;
+        what was missing was the asking.
+
+        The offer is recorded as settled either way, because a prompt that
+        comes back on every launch is worse than none. Saying no leaves the
+        scan one button away -- "Scan Games" is right there on the toolbar --
+        and Settings holds the switch for anyone who wants it never asked
+        again.
+
+        The short delay is the original one: neither a dialog nor a scan should
+        appear before the window is on screen, where it looks like a crash.
+        """
         state = load_state()
         if state.get("first_scan_done"):
             return
         state["first_scan_done"] = True
         save_state(state)
-        QTimer.singleShot(500, self._start_scan)
+        if not self.settings.get("auto_scan_on_first_run", True):
+            return
+        QTimer.singleShot(500, self._ask_to_scan_on_first_run)
+
+    def _ask_to_scan_on_first_run(self):
+        """Ask whether to scan now, and scan only if the answer is yes."""
+        reply = QMessageBox.question(
+            self,
+            "Look for installed games?",
+            "SaveGuard can look through your Documents, AppData and Steam "
+            "folders for games it can back up.\n\n"
+            "It reads those folders, which can take a while on a slow drive. "
+            "Nothing is added without your say-so — you pick what to keep — and "
+            "“Scan Games” is on the toolbar whenever you want this later.\n\n"
+            "Look for games now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._start_scan()
+            return
+        # Remembered so the question isn't asked again next launch. What
+        # re-enables it is turning the setting back on (see _on_open_settings).
+        state = load_state()
+        state["first_scan_declined"] = True
+        save_state(state)
+
+    def _rearm_first_scan_offer(self):
+        """Make the first-launch offer possible again after it was declined.
+
+        first_scan_done is what stops the offer returning on every launch, so
+        leaving it in place would make the setting look broken to exactly the
+        user who needs it: the one who said no the first time. Only a declined
+        offer is re-armed -- someone who already scanned has had the offer
+        settled, and re-asking would undo an answer they gave.
+        """
+        state = load_state()
+        if not state.pop("first_scan_declined", None):
+            return
+        state.pop("first_scan_done", None)
+        save_state(state)
 
     def _on_scan_for_games(self):
         if self.scan_worker is not None:

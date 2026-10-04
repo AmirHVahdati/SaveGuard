@@ -1548,9 +1548,29 @@ class TestStatusSweepIsOffThread:
 # ---------------------------------------------------------------------------
 
 class TestFirstScan:
-    def test_runs_once_then_never_again(self, app_dir, monkeypatch, qtbot):
+    """The first-launch offer.
+
+    The scan reads Documents, AppData and every Steam library on the machine,
+    so it is asked about rather than started: nothing here may walk the disk
+    before the user has agreed to it.
+    """
+
+    def scan_stub(self, monkeypatch):
         started = []
         monkeypatch.setattr(MainWindow, "_start_scan", lambda self: started.append(1))
+        return started
+
+    def answer_prompt(self, monkeypatch, reply=QMessageBox.Yes):
+        asked = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda parent, title, text, *a, **k: asked.append((title, text)) or reply,
+        )
+        return asked
+
+    def test_offers_the_scan_once_then_never_again(self, app_dir, monkeypatch, qtbot):
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch)
         window = MainWindow()
         qtbot.addWidget(window)
         try:
@@ -1558,16 +1578,96 @@ class TestFirstScan:
             qtbot.waitUntil(lambda: bool(started), timeout=2000)
             state = json.loads((app_dir / "state.json").read_text(encoding="utf-8"))
             assert state["first_scan_done"] is True
+            assert len(asked) == 1
 
-            window._maybe_run_first_scan()  # a second launch must not scan
+            window._maybe_run_first_scan()  # a second launch must not ask again
             qtbot.wait(50)
             assert len(started) == 1
+            assert len(asked) == 1
+        finally:
+            window.close()
+
+    def test_declining_scans_nothing_and_is_not_asked_again(
+            self, app_dir, monkeypatch, qtbot):
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch, QMessageBox.No)
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window._maybe_run_first_scan()
+            qtbot.waitUntil(lambda: bool(asked), timeout=2000)
+            qtbot.wait(50)
+
+            assert started == [], "a declined offer must not scan"
+            state = json.loads((app_dir / "state.json").read_text(encoding="utf-8"))
+            assert state["first_scan_declined"] is True
+
+            window._maybe_run_first_scan()  # and it must not come back
+            qtbot.wait(50)
+            assert len(asked) == 1
+        finally:
+            window.close()
+
+    def test_the_prompt_says_what_would_be_read(self, app_dir, monkeypatch, qtbot):
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch, QMessageBox.No)
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window._maybe_run_first_scan()
+            qtbot.waitUntil(lambda: bool(asked), timeout=2000)
+        finally:
+            window.close()
+        title, text = asked[0]
+        # The user is being asked permission to read their disk; say which
+        # folders and that nothing is added without them.
+        assert "Documents" in text and "Steam" in text
+        assert "Scan Games" in text
+        assert title == "Look for installed games?"
+
+    def test_the_prompt_defaults_to_no(self, app_dir, monkeypatch, qtbot):
+        self.scan_stub(monkeypatch)
+        defaults = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda parent, title, text, buttons, default: (
+                defaults.append(default) or QMessageBox.No
+            ),
+        )
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window._maybe_run_first_scan()
+            qtbot.waitUntil(lambda: bool(defaults), timeout=2000)
+        finally:
+            window.close()
+        # Enter on a permission prompt must not grant it.
+        assert defaults == [QMessageBox.No]
+
+    def test_no_prompt_and_no_scan_when_the_setting_is_off(
+            self, app_dir, monkeypatch, qtbot):
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch)
+        # MainWindow reads its settings through load_settings() in __init__, so
+        # this is what turns the offer off for a window built from here on.
+        monkeypatch.setattr(main_window_module, "load_settings",
+                            lambda: {"auto_scan_on_first_run": False})
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            assert window.settings["auto_scan_on_first_run"] is False
+            window._maybe_run_first_scan()
+            # Past the 500ms delay the offer would have fired by now, so this
+            # fails rather than passes by waiting less than the timer.
+            qtbot.wait(900)
+            assert asked == []
+            assert started == []
         finally:
             window.close()
 
     def test_is_skipped_once_it_has_run(self, app_dir, monkeypatch, qtbot):
-        started = []
-        monkeypatch.setattr(MainWindow, "_start_scan", lambda self: started.append(1))
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch)
         mark_first_scan_done()
         window = MainWindow()
         qtbot.addWidget(window)
@@ -1575,12 +1675,13 @@ class TestFirstScan:
             window._maybe_run_first_scan()
             qtbot.wait(50)
             assert started == []
+            assert asked == []
         finally:
             window.close()
 
-    def test_the_scan_is_delayed_so_the_window_can_paint(self, app_dir, monkeypatch, qtbot):
-        started = []
-        monkeypatch.setattr(MainWindow, "_start_scan", lambda self: started.append(1))
+    def test_the_offer_is_delayed_so_the_window_can_paint(self, app_dir, monkeypatch, qtbot):
+        started = self.scan_stub(monkeypatch)
+        asked = self.answer_prompt(monkeypatch)
         window = MainWindow()
         qtbot.addWidget(window)
         try:
@@ -1588,7 +1689,38 @@ class TestFirstScan:
             # Still nothing: a dialog popping up before the window is visible
             # looks like a crash.
             assert started == []
+            assert asked == []
+            qtbot.waitUntil(lambda: bool(asked), timeout=2000)
             qtbot.waitUntil(lambda: bool(started), timeout=2000)
+        finally:
+            window.close()
+
+    def test_turning_the_setting_back_on_re_arms_a_declined_offer(
+            self, app_dir, monkeypatch, qtbot):
+        # Otherwise the switch is inert for the one user who needs it: the one
+        # who said no. first_scan_done is what silences the prompt, so it has
+        # to be cleared along with the record of the refusal.
+        config.save_state({"first_scan_done": True, "first_scan_declined": True})
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window._rearm_first_scan_offer()
+            state = json.loads((app_dir / "state.json").read_text(encoding="utf-8"))
+            assert "first_scan_done" not in state
+            assert "first_scan_declined" not in state
+        finally:
+            window.close()
+
+    def test_re_arming_leaves_an_accepted_offer_alone(self, app_dir, monkeypatch, qtbot):
+        # Someone who already scanned had the question settled; re-asking
+        # would undo an answer they gave.
+        config.save_state({"first_scan_done": True})
+        window = MainWindow()
+        qtbot.addWidget(window)
+        try:
+            window._rearm_first_scan_offer()
+            state = json.loads((app_dir / "state.json").read_text(encoding="utf-8"))
+            assert state["first_scan_done"] is True
         finally:
             window.close()
 

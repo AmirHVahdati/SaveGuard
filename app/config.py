@@ -28,6 +28,14 @@ DEFAULT_SETTINGS = {
     # recent backups for each game, deleting older ones right after a new
     # backup completes successfully.
     "max_backups": 0,
+    # Whether SaveGuard may offer to look for games the first time it is
+    # opened. It asks before reading anything, so this is the switch for never
+    # being asked at all: the scan walks Documents, AppData and every Steam
+    # library on the machine, which is enough disk to be felt while the app is
+    # still opening on a slow drive. Opt-out rather than opt-in, since the
+    # offer is now a question the user has to be present for. The "Scan Games"
+    # button is unaffected either way.
+    "auto_scan_on_first_run": True,
 }
 
 
