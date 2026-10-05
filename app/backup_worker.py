@@ -62,6 +62,17 @@ _PATH_LENGTH_WINERRORS = frozenset({206, 123})
 _PATH_LENGTH_ERRNOS = frozenset({errno.ENAMETOOLONG})
 
 
+class BackupCancelled(Exception):
+    """Raised inside run() when an in-flight backup is asked to stop.
+
+    A cancellation, not a failure: the partial archive is discarded the same
+    way one from a failed write is, but it isn't surfaced as an error to the
+    user -- the shutdown path triggers it, and "cancelled" isn't an error
+    worth a modal. Raised at a file boundary only (never mid-write), so no zip
+    member is ever left half-written.
+    """
+
+
 def _is_path_length_error(exc: OSError) -> bool:
     """True if `exc` is the filesystem reporting a path that is too long."""
     # A live Win32 call populates both attributes -- measured winerror=123
@@ -282,6 +293,31 @@ class BackupWorker(QThread):
         # 0 = keep every backup forever; N = keep only the N most recent.
         # Same defensive clamping rationale as compression_level above.
         self.max_backups = clamp_max_backups(max_backups)
+        # A cancellation flag checked between files, not mid-write. Set by
+        # MainWindow when the user quits while a backup is in flight: the
+        # run() loop notices at the next file boundary and raises
+        # BackupCancelled, which the existing cleanup path discards the
+        # in-progress archive for. Deliberately cooperative rather than
+        # QThread.terminate(): killing the thread mid-zip-write would leave
+        # a corrupt archive on disk and skip the handlers run() would
+        # otherwise reach.
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Ask this backup to abort at the next file boundary.
+
+        Returns immediately and never blocks the caller -- it is typically
+        invoked from the main thread inside closeEvent. The worker notices the
+        flag at the next file and raises BackupCancelled, which discards the
+        in-progress archive the same way a verification failure would. The
+        check happens between files, never inside one, so no zip member is
+        ever left half-written in the archive or a file write interrupted
+        mid-call.
+        """
+        self._cancelled = True
+
+    def _aborted(self) -> bool:
+        return self._cancelled
 
     def run(self):
         zip_path = None
@@ -381,7 +417,22 @@ class BackupWorker(QThread):
                     # alters the backup without ever being detected as a change.
                     if os.path.islink(os.path.join(dirpath, fname)):
                         continue
+                    # The file list is a snapshot of the tree at one instant,
+                    # and for a large library it is also the slow part of the
+                    # walk -- so check for cancellation inside it, not just
+                    # after it, so a quit request isn't blocked by the walk it
+                    # is trying to end. Between files only: no file is ever read
+                    # partway through.
+                    if self._aborted():
+                        raise BackupCancelled()
                     files.append(os.path.join(dirpath, fname))
+
+            # A cancellation that landed during the walk is handled here, before
+            # any zip is opened -- so there is no partial archive to clean up,
+            # only the backup_root directory (already expected to exist) left
+            # behind, which needs no special handling.
+            if self._aborted():
+                raise BackupCancelled()
 
             # Raised before the archive is opened, so a refused backup leaves
             # nothing behind at all rather than a partial .zip that looks like
@@ -416,6 +467,12 @@ class BackupWorker(QThread):
                 **zip_kwargs,
             ) as zf:
                 for i, src in enumerate(files, start=1):
+                    if self._aborted():
+                        # Mid-archive this time. The `with` closes and finalises
+                        # the zip on the way out so it is a valid (partial)
+                        # archive rather than a truncated file, and
+                        # _discard_incomplete_archive deletes it below.
+                        raise BackupCancelled()
                     rel = os.path.relpath(src, self.save_path)
                     arcnames.append(rel)
                     zf.write(src, arcname=rel)
@@ -438,6 +495,14 @@ class BackupWorker(QThread):
             # what change detection compares against on the next launch.
             new_snapshot = build_snapshot(self.save_path)
             self.backup_finished.emit(self.game_id, new_snapshot, timestamp, zip_path, backups_remaining)
+        except BackupCancelled:
+            # Asked to stop (today, only by MainWindow shutting down). The
+            # partial archive -- if any made it this far -- is already being
+            # handled: either no zip was opened, or the `with` block above
+            # finalised it as a valid-but-incomplete archive before this was
+            # reached. Discard whichever case we're in and say nothing: this
+            # is a deliberate abort, not a failure the user needs to act on.
+            self._discard_incomplete_archive(zip_path, archive_verified)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
             self._discard_incomplete_archive(zip_path, archive_verified)
             self.error.emit(self.game_id, str(exc))

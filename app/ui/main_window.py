@@ -8,9 +8,12 @@ more than once per game per user action (see _recompute_statuses).
 """
 
 import os
+import time
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QEvent, QThread, Signal
+from PySide6.QtCore import (
+    Qt, QTimer, QUrl, QEvent, QEventLoop, QThread, QCoreApplication, Signal
+)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -65,6 +68,20 @@ CARD_HEIGHT = 268  # a card is closer to 128px; this is a conservative bound
 # off the disk's limit -- where the benefit grows, since the same 12 backups on
 # an HDD are bound by seeks rather than by cores.
 MAX_CONCURRENT_BACKUPS = 4
+
+# How long closeEvent will keep waiting for background work to finish before
+# it gives up on the quit. Long enough that a genuinely busy disk finishes
+# well inside it — a backup is a walk, a zip write and a full re-read — and
+# short enough that a wedged network share doesn't leave the user with a
+# window that won't close. Only ever reached by work that has stopped making
+# progress; see _drain_background_threads for what happens then.
+_SHUTDOWN_GRACE_MS = 120_000
+
+# How long each wait() call blocks inside the drain loop, in milliseconds.
+# Small enough that the event loop gets a turn often, which is what lets a
+# backup that finishes mid-shutdown have its result delivered before the
+# window goes away.
+_SHUTDOWN_POLL_MS = 50
 
 
 def _status_for(save_path, last_backup_time, last_snapshot) -> str:
@@ -148,6 +165,11 @@ class MainWindow(QMainWindow):
         self._show_summary_after_statuses: bool = False
         self.settings: dict = load_settings()
         self._status_update_pending: bool = False  # for batching UI updates during backup completions
+        # True from the moment a close starts until the window has either gone
+        # or been told it can't close yet. Suppresses the things a shutdown
+        # must not do: start another backup, or put a modal dialog on screen
+        # over the drain that is waiting on that very thread.
+        self._closing: bool = False
 
         self._load_games()
         self._build_ui()
@@ -950,6 +972,11 @@ class MainWindow(QMainWindow):
         self.scan_worker = None
 
     def _on_scan_finished(self, candidates):
+        if self._closing:
+            # A scan that lands while closeEvent is draining it. Its results
+            # are dropped along with the window -- popping the review dialog
+            # now would ask a question nobody is left to answer.
+            return
         if not candidates:
             self.status_bar.showMessage("No new games found in common save locations.", 5000)
             return
@@ -1020,38 +1047,134 @@ class MainWindow(QMainWindow):
 
     # ---------------- shutdown ----------------
 
-    def closeEvent(self, event):
-        # Give any in-flight background thread a moment to finish cleanly
-        # instead of yanking the process out from under it.
-        running = list(self.workers.values())
-        if self.scan_worker is not None:
-            running.append(self.scan_worker)
+    def _threads_in_flight(self) -> list:
+        """Snapshot of every background thread still running right now.
 
-        in_flight = [w for w in running if w.isRunning()]
-        if in_flight:
+        A snapshot of the live objects, not of the dicts holding them: a
+        backup that finishes while closeEvent is draining pops itself out of
+        self.workers, and the drain still needs a reference to wait on.
+        """
+        threads = list(self.workers.values())
+        if self.scan_worker is not None:
+            threads.append(self.scan_worker)
+        if self.status_worker is not None:
+            threads.append(self.status_worker)
+        return [w for w in threads if w.isRunning()]
+
+    def _drain_background_threads(self, threads: list) -> bool:
+        """Wait until every given thread has terminated. True if they all did.
+
+        A QThread whose Python object is destroyed while it is still running is
+        a fatal Qt error, not an exception: the process aborts outright with
+        0xC0000409 and no traceback (confirmed by dropping a running unparented
+        QThread). None of this app's workers is parented to the window -- that
+        is deliberate, since closeEvent runs underneath them -- which means the
+        close can't be accepted until every thread has actually ended, whether
+        it was cancelled or simply left running to finish.
+
+        The event loop is pumped while waiting, deliberately: a backup result
+        arrives as a queued signal handled on this thread, so a plain blocking
+        wait() would throw away a backup that finished during the drain -- the
+        archive on disk while games.json never records it, and the next launch
+        reporting the game as changed and taking that backup again. Pumping lets
+        those signals land first. That is only safe because _closing has been set,
+        which stops the drained handlers doing anything irreversible while it
+        happens -- see _pump_backup_queue, _on_backup_error and _on_scan_finished.
+
+        False means the grace period ran out with work still running, and the
+        caller refuses the close rather than proceeding: terminating a thread
+        would kill it mid-zip-write and leave a half-written archive that passes
+        for a real one, which is exactly what _discard_incomplete_archive exists
+        to prevent. The user can try quitting again once whatever SaveGuard is
+        working on has finished.
+
+        Cancelled backups return from this almost immediately -- cancel() is
+        checked at the next file boundary, so a 120s backup drains in under a
+        tick instead of running to completion. Read-only scans and sweeps are
+        not cancelled, only waited out, so they finish on their own terms.
+        """
+        deadline = time.monotonic() + _SHUTDOWN_GRACE_MS / 1000
+        while True:
+            alive = [w for w in threads if w.isRunning()]
+            if not alive:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            for thread in alive:
+                thread.wait(_SHUTDOWN_POLL_MS)
+            QCoreApplication.processEvents(QEventLoop.AllEvents,
+                                           _SHUTDOWN_POLL_MS)
+
+    def closeEvent(self, event):
+        # A second close arriving while the first is still draining. Ignored
+        # rather than allowed to start a second drain over the same threads;
+        # the first one is already going to accept the close on their behalf.
+        if self._closing:
+            event.ignore()
+            return
+        self._closing = True
+
+        # Backups are the only write work worth confirming, and they're the
+        # only kind "quit anyway" can usefully cancel -- a scan or status sweep
+        # only reads, so it is allowed to finish silently rather than prompted
+        # for or abandoned. A read-only sweep can't leave a fake backup behind
+        # the way an aborted zip write can, so waiting it out is the safe
+        # answer; see _drain_background_threads for the bound on that wait.
+        writing = [w for w in self.workers.values() if w.isRunning()]
+        if writing:
             reply = QMessageBox.question(
                 self,
                 "Backups in progress",
                 "SaveGuard is currently backing up game(s). "
-                "Quitting now may leave those backups incomplete.\n\n"
-                "Do you want to quit anyway?",
+                "The in-progress backup will be cancelled and its partial "
+                "archive discarded -- quitting now can't leave a corrupt or "
+                "half-finished backup behind.\n\n"
+                "Do you want to quit now?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply == QMessageBox.No:
                 # Don't quit - let the backups finish. The window stays open
                 # and the user can continue using the app while backups run.
+                self._closing = False
                 event.ignore()
                 return
 
-        # A status sweep only reads, so quitting during one costs nothing --
-        # unlike a backup, there is no half-written archive to worry about, and
-        # it is deliberately kept out of the prompt above. But the thread object
-        # cannot be destroyed while it is running, which Qt treats as a fatal
-        # error, so it has to be waited out rather than abandoned. The walk is
-        # bounded and off the critical path, so this is a formality.
-        if self.status_worker is not None and self.status_worker.isRunning():
-            self.status_worker.wait(5000)
+            # Yes, the user wants out. Ask every running backup to stop at the
+            # next file boundary -- cooperatively, so it never interrupts a
+            # single file write or a zip member mid-stream -- then drain them.
+            # They return almost immediately at the next check, so this is
+            # effectively instant rather than "wait for the whole backup".
+            for worker in writing:
+                worker.cancel()
+        elif self.scan_worker is not None and self.scan_worker.isRunning():
+            # No backups to confirm, but a scan is in flight and we still have
+            # to outwait it before the window can be destroyed. No prompt:
+            # a scan is read-only, so quitting during one loses nothing but
+            # time, and asking would just confuse the "no backups running"
+            # case.
+            pass
+
+        if not self._drain_background_threads(self._threads_in_flight()):
+            # Work that has stopped making progress -- a share that stopped
+            # answering, most likely. Staying open is the only safe answer here:
+            # the threads are still alive and still holding live handles on the
+            # save folder and the archive being written, and the alternatives are
+            # an aborted process or a corrupt-looking backup. Normal use resumes
+            # on its own once they finish.
+            self._closing = False
+            QMessageBox.warning(
+                self,
+                "Still finishing up",
+                "SaveGuard is still waiting on a backup or scan that isn't "
+                "responding, so it can't close cleanly yet.\n\n"
+                "Nothing has been lost and the window will stay open. Try "
+                "closing it again once whatever SaveGuard is working on has "
+                "finished — if the folder it is reading is on a network drive "
+                "or removable disk, check that it's still connected.",
+            )
+            event.ignore()
+            return
 
         event.accept()
 
@@ -1093,6 +1216,11 @@ class MainWindow(QMainWindow):
         a concurrency limit: every thread stayed live for the whole walk-and-zip,
         so they all ran at once.
         """
+        # Shutdown drains the queue by waiting out the threads already running
+        # (see closeEvent), and starting anything new here would add to what
+        # it has to wait for instead of finishing sooner.
+        if self._closing:
+            return
         while self._backup_queue and len(self.workers) < MAX_CONCURRENT_BACKUPS:
             self._start_backup(self._backup_queue.pop(0))
         if not self._backup_queue:
@@ -1193,7 +1321,15 @@ class MainWindow(QMainWindow):
         card = self.cards.get(game_id)
         if card:
             card.set_backing_up(False)
-        QMessageBox.critical(self, "Backup failed", message)
+        if self._closing:
+            # No modal on the way out. This signal is delivered by the event
+            # loop closeEvent is pumping in order to wait on this very thread,
+            # so a dialog here would sit on top of the drain that is waiting
+            # for the worker reporting it -- and then vanish with the window
+            # anyway, taking the explanation of why the backup failed with it.
+            self.status_bar.showMessage(f"Backup failed: {message}", 8000)
+        else:
+            QMessageBox.critical(self, "Backup failed", message)
         # Also update UI in case other backups were waiting to refresh
         self._schedule_status_update()
 

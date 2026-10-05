@@ -17,7 +17,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QDesktopServices, QResizeEvent
 from PySide6.QtWidgets import QMessageBox, QPushButton
 
@@ -78,17 +78,55 @@ class FakeEvent:
 
 
 class RunningWorker:
-    """Stands in for a worker that is still doing its job."""
+    """Stands in for a worker that is still doing its job.
+
+    Finishes when something waits on it, which is what a real thread does and
+    what lets closeEvent's shutdown drain terminate instead of running out its
+    grace period. Pass finishes_on_wait=False for the one case worth testing
+    separately: work that never ends however long you wait for it, so the drain
+    has to refuse the close rather than hang.
+    """
+
+    def __init__(self, finishes_on_wait=True):
+        self._running = True
+        self.finishes_on_wait = finishes_on_wait
+        self.wait_calls = 0
+        self.cancel_calls = 0
+        self.cancelled = False
 
     def isRunning(self):
+        return self._running
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.finishes_on_wait:
+            self._running = False
+        return self.finishes_on_wait
+
+    def cancel(self):
+        # Mirrors BackupWorker.cancel(): it is a request, not an instant stop
+        # -- the worker keeps running until it next checks the flag or is
+        # waited on, which is what lets the drain's wait() observe the
+        # cancellation the way a real thread's would.
+        self.cancel_calls += 1
+        self.cancelled = True
         return True
 
 
 class FinishedWorker:
     """Stands in for a worker whose thread has already ended."""
 
+    def __init__(self):
+        self.cancel_calls = 0
+
     def isRunning(self):
         return False
+
+    def wait(self, timeout=None):
+        return True
+
+    def cancel(self):
+        self.cancel_calls += 1
 
 
 class FakeScanWorker(QObject):
@@ -111,6 +149,12 @@ class FakeScanWorker(QObject):
 
     def isRunning(self):
         return self.started
+
+    def wait(self, timeout=None):
+        # The drain calls wait() on every in-flight thread; a fake worker
+        # just stops immediately.
+        self.started = False
+        return True
 
 
 def stub_dialog(monkeypatch, name, result_data=None, result_settings=None, accepted=True):
@@ -2106,7 +2150,8 @@ class TestCloseEvent:
         event = FakeEvent()
         main_window.closeEvent(event)
         assert asked
-        assert "may leave those backups incomplete" in asked[0]
+        assert "backing up game" in asked[0]
+        assert "cancelled" in asked[0]
 
     def test_declining_keeps_the_window_open(self, main_window, monkeypatch):
         main_window.workers["hades"] = RunningWorker()
@@ -2128,17 +2173,295 @@ class TestCloseEvent:
         main_window.closeEvent(event)
         assert event.accepted is True
 
-    def test_a_running_scan_counts_as_work_in_flight(self, main_window, monkeypatch):
+    def test_a_running_scan_is_waited_out_without_a_prompt(self, main_window, monkeypatch):
+        # A scan only reads -- see closeEvent -- so it isn't confirmed, and it
+        # isn't cancelled either: it simply finishes and the close proceeds.
         main_window.scan_worker = RunningWorker()
         asked = []
-        monkeypatch.setattr(
-            QMessageBox, "question",
-            lambda parent, title, text, *a, **k: asked.append(text) or QMessageBox.No,
-        )
+
+        def trap(parent, title, text, *a, **k):
+            asked.append(text)
+            return QMessageBox.No
+
+        monkeypatch.setattr(QMessageBox, "question", trap)
         event = FakeEvent()
         main_window.closeEvent(event)
-        assert asked
+
+        assert asked == []          # no prompt for read-only work
+        assert event.accepted is True
+        assert not main_window.scan_worker.isRunning()  # ...but it was waited out
+
+
+class TestCloseWaitsOutRunningThreads:
+    """Quitting has to mean every background thread has ended, not that the
+    user said so.
+
+    A QThread destroyed while it is still running is a fatal Qt error, not an
+    exception: the process aborts with 0xC0000409 and no traceback (confirmed
+    by dropping a running unparented QThread). None of this app's workers is
+    parented to the window -- deliberately, since closeEvent runs underneath
+    them -- so accepting the close while one is live hands its last Python
+    reference to the garbage collector mid-run. Quitting during a backup used
+    to do exactly that, on the Yes path of the prompt.
+    """
+
+    def _confirm_quit(self, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+    def test_a_backup_in_flight_is_waited_out_before_closing(self, main_window,
+                                                              monkeypatch):
+        worker = RunningWorker()
+        main_window.workers["hades"] = worker
+        self._confirm_quit(monkeypatch)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is True
+        # Not merely accepted after a token wait -- the thread was waited on
+        # until it actually ended, which is what makes its destruction safe.
+        assert worker.wait_calls > 0
+        assert not worker.isRunning()
+
+    def test_a_scan_in_flight_is_waited_out_before_closing(self, main_window,
+                                                           monkeypatch):
+        main_window.scan_worker = RunningWorker()
+        self._confirm_quit(monkeypatch)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is True
+        assert not main_window.scan_worker.isRunning()
+
+    def test_a_backup_and_a_sweep_are_both_waited_out(self, main_window, monkeypatch):
+        backup = RunningWorker()
+        sweep = RunningWorker()
+        main_window.workers["hades"] = backup
+        main_window.status_worker = sweep
+        self._confirm_quit(monkeypatch)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is True
+        assert not backup.isRunning()
+        assert not sweep.isRunning()
+
+    def test_work_that_never_finishes_refuses_the_close(self, main_window, monkeypatch):
+        # A share that stopped answering is the realistic case. Closing anyway
+        # would mean either an aborted process or a half-written archive left
+        # to pass for a backup, so the window stays open and keeps waiting.
+        monkeypatch.setattr(main_window_module, "_SHUTDOWN_GRACE_MS", 0)
+        warned = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            lambda parent, title, text, *a, **k: warned.append(text),
+        )
+        stuck = RunningWorker(finishes_on_wait=False)
+        main_window.workers["hades"] = stuck
+        self._confirm_quit(monkeypatch)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
         assert event.accepted is False
+        assert stuck.isRunning()          # left alone, not killed
+        assert warned
+        # And the window is fully usable again afterwards -- the next close has
+        # to be allowed to try once the thread has finished.
+        assert main_window._closing is False
+
+    def test_declining_leaves_the_window_fully_usable(self, main_window, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+        main_window.workers["hades"] = RunningWorker()
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is False
+        assert main_window._closing is False
+
+    def test_a_second_close_mid_drain_is_ignored(self, main_window, monkeypatch):
+        # The event loop is pumped while draining, so the title bar's X is live
+        # and can be clicked again. A second close must not start a second drain
+        # over the same threads; the first one accepts on their behalf.
+        main_window._closing = True
+        event = FakeEvent()
+        main_window.closeEvent(event)
+        assert event.accepted is False
+
+    def test_a_backup_result_still_lands_while_draining(self, main_window, monkeypatch):
+        # The drain pumps the event loop on purpose: a backup that finishes
+        # during shutdown reports through a queued signal on this thread, and
+        # discarding it would leave a good archive on disk that games.json never
+        # recorded -- so the next launch would report the game as changed and
+        # take the same backup again.
+        delivered = []
+        monkeypatch.setattr(
+            main_window, "_on_backup_finished",
+            lambda *a: delivered.append(a[0]),
+        )
+        worker = RunningWorker()
+        main_window.workers["hades"] = worker
+        self._confirm_quit(monkeypatch)
+
+        # Stands in for the queued signal arriving while wait() blocks.
+        original_wait = worker.wait
+
+        def wait_then_report(timeout=None):
+            result = original_wait(timeout)
+            QTimer.singleShot(0, lambda: main_window._on_backup_finished("hades"))
+            return result
+
+        worker.wait = wait_then_report
+
+        main_window.closeEvent(FakeEvent())
+
+        assert delivered == ["hades"]
+
+
+class TestShutdownSuppressesIrreversibleWork:
+    """The shutdown drain pumps the event loop, so the handlers it delivers to
+    run while the window is on its way out. Anything irreversible in them has
+    to stand down, or closing would start new work and put modals on screen
+    over the drain that is waiting on the very thread reporting the problem.
+    """
+
+    def test_no_new_backups_start_while_shutting_down(self, main_window):
+        started = []
+        main_window._start_backup = started.append
+        main_window._backup_queue = ["a", "b", "c"]
+        main_window._closing = True
+
+        main_window._pump_backup_queue()
+
+        assert started == []
+
+    def test_a_backup_error_during_shutdown_does_not_pop_a_modal(self, main_window,
+                                                                monkeypatch):
+        popped = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            lambda *a, **k: popped.append(a[1]),
+        )
+        main_window._closing = True
+
+        main_window._on_backup_error("hades", "the disk went away")
+
+        assert popped == []
+        assert "the disk went away" in main_window.status_bar.currentMessage()
+
+    def test_a_failed_backup_still_pops_a_modal_normally(self, main_window, monkeypatch):
+        popped = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            lambda *a, **k: popped.append(a[1]),
+        )
+        main_window._closing = False
+
+        main_window._on_backup_error("hades", "the disk went away")
+
+        assert popped == ["Backup failed"]
+
+    def test_a_scan_landing_mid_shutdown_is_dropped(self, main_window, monkeypatch):
+        shown = []
+        monkeypatch.setattr(
+            main_window_module, "ScanResultsDialog",
+            lambda *a, **k: shown.append(a),
+        )
+        main_window._closing = True
+
+        main_window._on_scan_finished([game_scanner.ScanCandidate(
+            name="Hades", save_path="C:/saves/hades", source="Steam",
+            confidence="high",
+        )])
+
+        assert shown == []
+
+
+class TestCloseCancelsBackups:
+    """"Quit anyway" means quit now, not "wait for the backup to finish".
+
+    The user clicking Yes to the shutdown prompt has, by definition, decided
+    that getting out is more important than the in-flight backup. Rather than
+    wait for a long archive to complete (which is what the naive fix for the
+    quit-during-backup crash does), SaveGuard cancels running backups at the
+    next file boundary and lets the existing discard path throw away whatever
+    partial archive was started -- so the user leaves promptly with no corrupt
+    archive left behind. Read-only scans and status sweeps are not cancelled,
+    only waited out.
+    """
+
+    def test_confirming_quit_cancels_in_flight_backups(self, main_window, monkeypatch):
+        worker = RunningWorker()
+        main_window.workers["hades"] = worker
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is True
+        assert worker.cancel_calls == 1
+        assert worker.cancelled is True
+
+    def test_declining_quit_does_not_cancel_backups(self, main_window, monkeypatch):
+        worker = RunningWorker()
+        main_window.workers["hades"] = worker
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+
+        event = FakeEvent()
+        main_window.closeEvent(event)
+
+        assert event.accepted is False
+        assert worker.cancel_calls == 0
+        assert worker.cancelled is False
+
+    def test_a_backup_in_flight_is_cancelled_before_the_close_is_accepted(
+            self, main_window, qtbot, tmp_path, monkeypatch):
+        # End-to-end with a real BackupWorker: the worker is on a different OS
+        # thread, cancel() is a flag set from this one, and the thread must
+        # notice it at the next file boundary, raise BackupCancelled, discard
+        # any partial archive and terminate -- so the only references left are
+        # ones that are safe to destroy.
+        from app.backup_worker import BackupWorker
+        import app.backup_worker as bwmod
+
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        out = tmp_path / "out"
+        # Enough files to make the walk span a few milliseconds, and a patched
+        # islink that adds a tiny delay widens the cancellation window so the
+        # test is deterministic rather than a race against a fast SSD.
+        big = 3000
+        for i in range(big):
+            (saves / f"save{i}.dat").write_text("x")
+        real_islink = bwmod.os.path.islink
+        def slow_islink(p):
+            time.sleep(0.0002)
+            return real_islink(p)
+        monkeypatch.setattr(bwmod.os.path, "islink", slow_islink)
+
+        worker = BackupWorker("hades", "Hades", str(saves), str(out))
+        worker.start()
+        assert worker.isRunning()
+        # The walk is deliberately slow; cancelling now must be observed while
+        # it is still collecting files, before any archive is opened.
+        worker.cancel()
+        assert worker.wait(5000)
+
+        assert not worker.isRunning()
+        # The partial archive -- if one was even opened -- is gone.
+        assert not out.exists() or not any(out.iterdir())
+
+    def test_a_finished_backup_is_not_cancelled_on_quit(self, main_window, monkeypatch):
+        worker = FinishedWorker()
+        main_window.workers["hades"] = worker
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+        main_window.closeEvent(FakeEvent())
+
+        assert worker.cancel_calls == 0
 
 
 # ---------------------------------------------------------------------------
