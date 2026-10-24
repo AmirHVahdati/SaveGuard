@@ -11,7 +11,7 @@ background sync to be the only copy of their saves.
 |---|---|
 | **Version** | 1.0.0 |
 | **License** | [MIT](LICENSE) |
-| **Platforms** | Windows, Linux (experimental, including SteamOS and CachyOS) |
+| **Platforms** | Windows, Linux (experimental) |
 | **Runtime dependencies** | [PySide6](https://doc.qt.io/qtforpython/) only |
 
 ---
