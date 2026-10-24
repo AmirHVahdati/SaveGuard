@@ -86,7 +86,11 @@ class TestSaveGames:
     def test_leaves_no_temporary_files_behind(self, app_dir):
         config.save_games([{"id": "1"}])
         config.save_games([{"id": "2"}])
-        assert [p.name for p in app_dir.iterdir()] == ["games.json"]
+        leftover = {p.name for p in app_dir.iterdir()}
+        # No .tmp files from mkstemp should remain; the .bak is a deliberate
+        # recovery copy created by the atomic-write backup rotation.
+        assert not any(name.endswith(".tmp") for name in leftover)
+        assert leftover == {"games.json", "games.json.bak"}
 
     def test_returns_true_on_success(self, app_dir):
         assert config.save_games([]) is True

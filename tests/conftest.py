@@ -87,8 +87,15 @@ def app_dir(tmp_path, monkeypatch):
     redirected = tmp_path / ".saveguard"
     monkeypatch.setattr(config_module, "APP_DIR", redirected)
     monkeypatch.setattr(config_module, "CONFIG_FILE", redirected / "games.json")
+    monkeypatch.setattr(config_module, "CONFIG_CORRUPT_FILE", redirected / "games.json.corrupt")
+    monkeypatch.setattr(config_module, "CONFIG_BAK_FILE", redirected / "games.json.bak")
     monkeypatch.setattr(config_module, "STATE_FILE", redirected / "state.json")
     monkeypatch.setattr(config_module, "SETTINGS_FILE", redirected / "settings.json")
+    # load_games() sets _games_corrupt when it encounters an unparseable
+    # config file; the flag is deliberately process-lifetime and never
+    # auto-clears. Reset it so one test's corrupt-file probe does not poison
+    # save_games() for every subsequent test.
+    monkeypatch.setattr(config_module, "_games_corrupt", False)
     # app.updater imports APP_DIR by value and derives its cache path from it
     # at import time, so both bindings need redirecting.
     monkeypatch.setattr(updater_module, "APP_DIR", redirected)

@@ -112,13 +112,13 @@ def check_for_updates(force: bool = False) -> Optional[ReleaseInfo]:
 
 def fetch_release_notes(version: str) -> str:
     """Fetch release notes for a specific version tag from GitHub's API."""
+    tag = version.lstrip("v")
     try:
-        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/v{tag}"
         req = urllib.request.Request(url, headers={"User-Agent": "SaveGuard"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        if data.get("tag_name", "").lstrip("v") == version:
-            return data.get("body", "")
+        return data.get("body", "")
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
         pass
     return ""

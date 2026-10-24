@@ -268,11 +268,21 @@ class TestFetchReleaseNotes:
 
     def test_v_prefix_is_ignored_on_both_sides(self, github, app_dir):
         github.serve(release("v1.1.0", body="notes"))
-        assert fetch_release_notes("1.1.0") == "notes"
+        assert fetch_release_notes("v1.1.0") == "notes"
 
-    def test_returns_nothing_for_a_different_version(self, github, app_dir):
+    def test_requests_the_version_specific_endpoint(self, github, app_dir):
         github.serve(release("v1.1.0", body="notes"))
-        assert fetch_release_notes("1.0.0") == ""
+        fetch_release_notes("1.1.0")
+        assert github.calls[0][0] == \
+            f"https://api.github.com/repos/{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/releases/tags/v1.1.0"
+
+    def test_returns_nothing_for_a_nonexistent_version(self, github, app_dir):
+        # GitHub returns 404 for a tag that doesn't exist.
+        github.serve(urllib.error.HTTPError(
+            url="https://api.github.com/repos/amirvahdati/saveguard/releases/tags/v9.9.9",
+            code=404, msg="Not Found", hdrs=None, fp=None,
+        ))
+        assert fetch_release_notes("9.9.9") == ""
 
     def test_returns_nothing_when_the_request_fails(self, github, app_dir):
         github.serve(urllib.error.URLError("offline"))
