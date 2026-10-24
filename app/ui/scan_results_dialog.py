@@ -154,9 +154,7 @@ class ScanResultsDialog(QDialog):
 
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
-        name_label = QLabel("Game name")
-        name_label.setStyleSheet("color: #8b90a3; font-size: 10px;")
-        text_col.addWidget(name_label)
+        text_col.setContentsMargins(0, 0, 0, 0)
 
         name_edit = QLineEdit()
         name_edit.setText(candidate.name)
@@ -188,7 +186,7 @@ class ScanResultsDialog(QDialog):
             f"color: {badge_color}; font-size: 11px; font-weight: 600; "
             f"background-color: #22{badge_color[1:]}; border-radius: 8px; padding: 3px 8px;"
         )
-        layout.addWidget(source_badge, 0, Qt.AlignTop)
+        layout.addWidget(source_badge, 0, Qt.AlignVCenter)
         layout.addSpacing(6)
 
         open_btn = QPushButton()
@@ -207,7 +205,7 @@ class ScanResultsDialog(QDialog):
             }
         """)
         open_btn.clicked.connect(lambda checked, path=candidate.save_path: self._open_in_explorer(path))
-        layout.addWidget(open_btn)
+        layout.addWidget(open_btn, 0, Qt.AlignVCenter)
 
         self.checkboxes.append((checkbox, candidate))
         return row
