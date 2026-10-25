@@ -67,7 +67,7 @@ class TestPathKey:
         target = tmp_path / "MyGame"
         target.mkdir()
         upper = str(target).upper()
-        if os.path.normcase("A") == os.path.normcase("a"):
+        if os.path.normcase("A") != os.path.normcase("a"):
             pytest.skip("filesystem is case-sensitive")
         assert utils.path_key(upper) == utils.path_key(str(target))
 

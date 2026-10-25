@@ -1327,7 +1327,7 @@ class TestDiscoverCandidates:
     def test_tracked_paths_are_compared_case_insensitively_where_it_matters(self, world):
         home, _steam = world
         tracked = str(home / "Documents" / "My Games" / "Hades").upper()
-        if os.path.normcase("A") == os.path.normcase("a"):
+        if os.path.normcase("A") != os.path.normcase("a"):
             pytest.skip("filesystem is case-sensitive")
         assert "Hades" not in names_of(self._discover(world, existing=[tracked]))
 
