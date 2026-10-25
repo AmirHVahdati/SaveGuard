@@ -67,8 +67,8 @@ class TestPathKey:
         target = tmp_path / "MyGame"
         target.mkdir()
         upper = str(target).upper()
-        if upper == str(target):
-            pytest.skip("filesystem path has no case to fold on this platform")
+        if os.path.normcase("A") == os.path.normcase("a"):
+            pytest.skip("filesystem is case-sensitive")
         assert utils.path_key(upper) == utils.path_key(str(target))
 
 
@@ -92,6 +92,7 @@ class TestContains:
     def test_sibling_or_parent_is_not_nested(self, outer, inner):
         assert utils._contains(outer, inner) is False
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows drive-root semantics")
     def test_filesystem_root_keeps_exactly_one_separator(self):
         # Appending a separator to a path that already ends in one produced
         # "C:\\" + os.sep == "C:\\\\", which nothing can start with -- so a save

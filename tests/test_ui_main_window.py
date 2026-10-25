@@ -2066,8 +2066,8 @@ class TestAddScannedGamesDeduplication:
         # Only meaningful where the filesystem has case to fold; on POSIX
         # "Hades" and "HADES" really are two folders and both are legitimate.
         different_case = str(save_root).upper()
-        if different_case == str(save_root):
-            pytest.skip("filesystem path has no case to fold on this platform")
+        if os.path.normcase("A") == os.path.normcase("a"):
+            pytest.skip("filesystem is case-sensitive")
         main_window.settings = {"default_scan_backup_root": str(tmp_path / "backups")}
         make_game(main_window, "Hades", save_root)
 
