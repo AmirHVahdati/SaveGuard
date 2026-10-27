@@ -25,7 +25,7 @@ a = Analysis(
         "PySide6.QtPositioning", "PySide6.QtNetwork",
         "PySide6.Qt3DCore", "PySide6.Qt3DRender",
         "PySide6.QtSql", "PySide6.QtSvgWidgets", "PySide6.QtXml",
-        "tkinter", "unittest", "pydoc", "email",
+        "tkinter", "unittest", "pydoc",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
