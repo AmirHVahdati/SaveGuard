@@ -4,8 +4,6 @@
 and it keeps a restorable, timestamped copy of it, then tells you when the game
 has changed since you last backed up. No Steam Cloud, no launcher, no account.
 
-![SaveGuard screenshot](assets/screenshot.png)
-
 Built for the games that have neither — or for players who simply don't trust a
 background sync to be the only copy of their saves.
 
@@ -15,6 +13,8 @@ background sync to be the only copy of their saves.
 | **License** | [MIT](LICENSE) |
 | **Platforms** | Windows, Linux (experimental) |
 | **Runtime dependencies** | [PySide6](https://doc.qt.io/qtforpython/) only |
+
+![SaveGuard screenshot](assets/screenshot.png)
 
 ---
 
