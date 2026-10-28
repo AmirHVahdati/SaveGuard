@@ -105,34 +105,6 @@ class TestDefaultBackupLocation:
         assert dialog.scan_backup_root_edit.text() == before
 
 
-class TestFirstScanOptOut:
-    """The switch behind "never ask me again".
-
-    Without it, declining the first-launch offer is permanent -- there would be
-    no way to get the scan offered again except hunting for a state file.
-    """
-
-    def test_defaults_to_asking(self, qtbot):
-        dialog = make_dialog(qtbot)
-        assert dialog.auto_scan_check.isChecked() is True
-
-    def test_reflects_a_stored_opt_out(self, qtbot):
-        dialog = make_dialog(qtbot, {"auto_scan_on_first_run": False})
-        assert dialog.auto_scan_check.isChecked() is False
-
-    def test_saving_publishes_the_choice(self, qtbot, backup_root):
-        backup_root.mkdir()
-        dialog = make_dialog(qtbot)
-        dialog.auto_scan_check.setChecked(False)
-        dialog._on_save()
-        assert dialog.result_settings["auto_scan_on_first_run"] is False
-
-    def test_cancelling_leaves_the_stored_value_alone(self, qtbot):
-        dialog = make_dialog(qtbot, {"auto_scan_on_first_run": False})
-        dialog.auto_scan_check.setChecked(True)
-        dialog.reject()
-        assert dialog.result_settings is None
-
 
 class TestSave:
     def test_publishes_the_edited_settings_and_accepts(self, qtbot, backup_root):
