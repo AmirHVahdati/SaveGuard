@@ -178,29 +178,6 @@ class SettingsDialog(QDialog):
         path_row.addWidget(browse_btn)
         layout.addLayout(path_row)
 
-        divider3 = QFrame()
-        divider3.setFrameShape(QFrame.HLine)
-        divider3.setStyleSheet("background-color: #262b3a; max-height: 1px; border: none; margin: 16px 0;")
-        layout.addWidget(divider3)
-
-        discovery_label = QLabel("Finding games")
-        discovery_label.setStyleSheet("font-weight: 600; font-size: 13px;")
-        layout.addWidget(discovery_label)
-
-        self.auto_scan_check = QCheckBox("Ask before scanning for games on first launch")
-        self.auto_scan_check.setChecked(bool(self.settings.get("auto_scan_on_first_run", True)))
-        layout.addWidget(self.auto_scan_check)
-
-        discovery_hint = QLabel(
-            "The first time SaveGuard opens, it can offer to look through Documents, "
-            "AppData and Steam folders for games to back up. Reading those folders can "
-            "take a while on a slow drive, so it asks first. Turning this off means it "
-            "never asks; “Scan Games” still works whenever you want it."
-        )
-        discovery_hint.setWordWrap(True)
-        discovery_hint.setStyleSheet("color: #8b90a3; font-size: 12px; margin-top: 4px;")
-        layout.addWidget(discovery_hint)
-
         layout.addStretch()
         self._on_slider_changed(self.slider.value())
         return tab
@@ -330,7 +307,6 @@ class SettingsDialog(QDialog):
     def _on_save(self):
         self.settings["compression_level"] = self.slider.value()
         self.settings["max_backups"] = self.max_backups_spin.value()
-        self.settings["auto_scan_on_first_run"] = self.auto_scan_check.isChecked()
 
         path = self.scan_backup_root_edit.text().strip()
         # Only a path the user typed or changed is validated, and an unchanged
